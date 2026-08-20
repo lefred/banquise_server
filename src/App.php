@@ -441,6 +441,7 @@ final class BanquiseApp
 
     public function importRepository(string $repository, array $metadata): string
     {
+        $this->requireLocalCatalogMode();
         if (!preg_match('#^(https://github\.com/)?[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/?$#', $repository)) {
             throw new InvalidArgumentException('Invalid GitHub repository');
         }
@@ -474,6 +475,7 @@ final class BanquiseApp
      */
     public function previewRepository(string $repository, array $metadata): array
     {
+        $this->requireLocalCatalogMode();
         if (!preg_match('#^(https://github\.com/)?[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/?$#', $repository)) {
             throw new InvalidArgumentException('Invalid GitHub repository');
         }
@@ -620,6 +622,7 @@ final class BanquiseApp
      */
     public function checkForPluginUpdates(): array
     {
+        $this->requireLocalCatalogMode();
         // A catalog with many distinct repositories makes one sequential GitHub
         // API call each; give this room to run past PHP's default web request
         // execution limit rather than being killed silently mid-way.
@@ -790,6 +793,10 @@ final class BanquiseApp
 
     private function signAndPublish(string $temporary, string $password): void
     {
+        // Every catalog-mutating path (add/edit/delete/refresh, distribution
+        // mode, legacy cleanup) funnels through here, so this one guard is
+        // enough to keep them all off while an external catalog is mirrored.
+        $this->requireLocalCatalogMode();
         // Rewrite download_url to match the active distribution mode before
         // signing, so the signature covers exactly what agents will fetch.
         $this->normalizeArtifactDistribution($temporary);
@@ -808,6 +815,7 @@ final class BanquiseApp
         }
         $this->pruneStaleUpdateChecks($this->catalog());
         $this->pruneOrphanedArtifacts();
+        $this->pruneStaleAuthorityChecks($this->catalog());
     }
 
     // ------------------------------------------------------------------
@@ -942,6 +950,423 @@ final class BanquiseApp
             if ($file[0] === '.' || isset($referenced[$file])) continue;
             @unlink("$directory/$file");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // External catalog source: mirror another Banquise (or compatible)
+    // instance's signed catalog verbatim instead of curating one locally.
+    // ------------------------------------------------------------------
+
+    public function catalogMode(): string
+    {
+        $mode = $this->getSetting('catalog_mode') ?? (string)($this->config['catalog_mode'] ?? 'local');
+        if ($mode !== 'remote') return 'local';
+        // Self-heal: never report "remote" without a source to actually mirror,
+        // so a corrupted or half-written settings row can't lock an admin out
+        // of local catalog management with nothing to show for it.
+        return ($this->remoteCatalogUrl() !== '' && $this->remoteCatalogPublicKey() !== '') ? 'remote' : 'local';
+    }
+
+    public function remoteCatalogUrl(): string
+    {
+        return $this->getSetting('remote_catalog_url') ?? '';
+    }
+
+    public function remoteCatalogPublicKey(): string
+    {
+        return $this->getSetting('remote_catalog_public_key') ?? '';
+    }
+
+    public function remoteCatalogSyncedAt(): string
+    {
+        return $this->getSetting('remote_catalog_synced_at') ?? '';
+    }
+
+    /** @throws RuntimeException if the catalog is currently mirrored from an external source. */
+    private function requireLocalCatalogMode(): void
+    {
+        if ($this->catalogMode() === 'remote') {
+            throw new RuntimeException(
+                'The catalog is mirrored from an external source; local changes are disabled while that mode is on.'
+            );
+        }
+    }
+
+    /**
+     * Switches between local management ("local") and mirroring another
+     * catalog verbatim ("remote"). Enabling remote mode verifies the mirror
+     * against the submitted URL/key BEFORE saving either one: saving first
+     * and verifying after would let a failed re-key attempt leave the stored
+     * key mismatched with whatever catalog.json (from the last successful
+     * sync) is still being served from /catalog.pub — a silent verification
+     * break for every agent, not just a rejected form submission.
+     */
+    public function setCatalogSource(string $mode, string $url, string $publicKey): string
+    {
+        if (!in_array($mode, ['local', 'remote'], true)) throw new InvalidArgumentException('Invalid catalog mode.');
+        if ($mode === 'local') {
+            $this->setSetting('catalog_mode', 'local');
+            return 'Catalog mode set to local management.';
+        }
+        $url = trim($url);
+        $publicKey = trim($publicKey);
+        if (!preg_match('#^https://#', $url)) throw new InvalidArgumentException('External catalog URL must use HTTPS.');
+        if ($publicKey === '') throw new InvalidArgumentException('Upload the external catalog\'s Minisign public key.');
+        // No further format checking here: minisign itself is the authority
+        // on whether this is a well-formed key, in pullRemoteCatalog() below.
+        $syncMessage = $this->pullRemoteCatalog($url, $publicKey); // throws before anything is saved if this fails
+        $this->setSetting('remote_catalog_url', $url);
+        $this->setSetting('remote_catalog_public_key', $publicKey);
+        $this->setSetting('catalog_mode', 'remote');
+        return "External catalog mode enabled. $syncMessage";
+    }
+
+    /** Re-fetches the already-configured external catalog on demand. */
+    public function syncRemoteCatalog(): string
+    {
+        $url = $this->remoteCatalogUrl();
+        $publicKey = $this->remoteCatalogPublicKey();
+        if ($url === '' || $publicKey === '') throw new RuntimeException('Configure the external catalog URL and public key first.');
+        return $this->pullRemoteCatalog($url, $publicKey);
+    }
+
+    /**
+     * Downloads $url and $url.minisig, verifies the signature against
+     * $publicKey, and only then atomically replaces the local catalog files
+     * with the verified bytes — untouched, so they stay verifiable against
+     * the external key exactly as published upstream. Nothing is re-signed
+     * with this server's own key: Banquise isn't vouching for entries it
+     * didn't curate, only relaying someone else's signed catalog.
+     */
+    private function pullRemoteCatalog(string $url, string $publicKey): string
+    {
+        $lock = $this->catalogLock();
+        $catalogFile = (string)$this->config['catalog'];
+        $temporary = $this->temporaryCatalogPath();
+        $temporarySig = $temporary . '.minisig';
+        $temporaryKey = $temporary . '.pub';
+        try {
+            $this->downloadUrlToFile($url, $temporary);
+            $this->downloadUrlToFile($url . '.minisig', $temporarySig);
+            if (file_put_contents($temporaryKey, $publicKey . "\n") === false) {
+                throw new RuntimeException('Cannot stage the external public key.');
+            }
+            [$code, , $stderr] = $this->runProcess(
+                ['minisign', '-V', '-q', '-p', $temporaryKey, '-m', $temporary, '-x', $temporarySig], ''
+            );
+            if ($code !== 0) throw new RuntimeException('Signature verification failed: ' . (trim($stderr) ?: "minisign exited $code"));
+            $decoded = json_decode((string)file_get_contents($temporary), true);
+            if (!is_array($decoded) || !is_array($decoded['plugins'] ?? null)) {
+                throw new RuntimeException('The downloaded file is not a valid Banquise catalog.');
+            }
+            chmod($temporary, 0644);
+            if (!rename($temporarySig, $catalogFile . '.minisig') || !rename($temporary, $catalogFile)) {
+                throw new RuntimeException('Cannot atomically publish the mirrored catalog.');
+            }
+            $this->setSetting('remote_catalog_synced_at', self::now());
+            $count = count($decoded['plugins']);
+            return "Fetched and verified $count catalog entr" . ($count === 1 ? 'y' : 'ies') . ' from the external catalog.';
+        } finally {
+            foreach ([$temporary, $temporarySig, $temporaryKey] as $file) if (is_file($file)) unlink($file);
+            flock($lock, LOCK_UN); fclose($lock);
+        }
+    }
+
+    private function downloadUrlToFile(string $url, string $destination): void
+    {
+        if (!preg_match('#^https://#', $url)) throw new InvalidArgumentException('URL must use HTTPS.');
+        [$code, , $stderr] = $this->runProcess(
+            ['curl', '-fsSL', '--connect-timeout', '8', '--max-time', '30', '-o', $destination, $url], ''
+        );
+        if ($code !== 0) throw new RuntimeException("Could not download $url: " . (trim($stderr) ?: "curl exited $code"));
+    }
+
+    private function getSetting(string $name): ?string
+    {
+        $statement = $this->db->prepare('SELECT value FROM settings WHERE name=?');
+        $statement->execute([$name]);
+        $value = $statement->fetchColumn();
+        return $value === false ? null : (string)$value;
+    }
+
+    private function setSetting(string $name, string $value): void
+    {
+        $sql = $this->databaseDriver === 'mariadb'
+            ? 'INSERT INTO settings(name,value) VALUES(?,?) ON DUPLICATE KEY UPDATE value=VALUES(value)'
+            : 'INSERT INTO settings(name,value) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value';
+        $this->db->prepare($sql)->execute([$name, $value]);
+    }
+
+    // ------------------------------------------------------------------
+    // Authority verification: an optional, local-management-only cross
+    // check against another Banquise's catalog — unlike external catalog
+    // mode, this never adopts anything automatically; it only flags
+    // differences and offers a one-entry-at-a-time way to pull them in.
+    // ------------------------------------------------------------------
+
+    public function authorityEnabled(): bool
+    {
+        // Folding the mode check in here means every other authority method
+        // that starts with "if (!$this->authorityEnabled())" automatically
+        // stays off in external catalog mode too, with no extra checks.
+        return $this->catalogMode() === 'local' && $this->getSetting('authority_enabled') === 'true';
+    }
+
+    public function authorityCatalogUrl(): string
+    {
+        return $this->getSetting('authority_catalog_url') ?? '';
+    }
+
+    public function authorityCatalogPublicKey(): string
+    {
+        return $this->getSetting('authority_catalog_public_key') ?? '';
+    }
+
+    public function authorityCheckedAt(): string
+    {
+        return $this->getSetting('authority_checked_at') ?? '';
+    }
+
+    /**
+     * Enables or disables authority verification, or updates the authority's
+     * URL/key. Enabling tests the fetch+verify before saving anything, same
+     * as external catalog mode, so a bad key can't silently replace a good
+     * one; disabling keeps the URL/key on record so re-enabling later
+     * doesn't need re-uploading them.
+     */
+    public function setAuthoritySource(bool $enabled, string $url, string $publicKey): string
+    {
+        if (!$enabled) {
+            $this->setSetting('authority_enabled', 'false');
+            return 'Authority verification disabled.';
+        }
+        $url = trim($url);
+        $publicKey = trim($publicKey);
+        if (!preg_match('#^https://#', $url)) throw new InvalidArgumentException('Authority catalog URL must use HTTPS.');
+        if ($publicKey === '') throw new InvalidArgumentException("Upload the authority catalog's Minisign public key.");
+        $authorityCatalog = $this->fetchAuthorityCatalog($url, $publicKey); // throws before anything is saved if this fails
+        $this->setSetting('authority_catalog_url', $url);
+        $this->setSetting('authority_catalog_public_key', $publicKey);
+        $this->setSetting('authority_enabled', 'true');
+        return 'Authority verification enabled. ' . $this->compareAgainstAuthority($authorityCatalog);
+    }
+
+    /** Re-runs the comparison against the already-configured authority (the "Verify" action). */
+    public function checkAgainstAuthority(): string
+    {
+        if (!$this->authorityEnabled()) throw new RuntimeException('Configure and enable an authority catalog first.');
+        $authorityCatalog = $this->fetchAuthorityCatalog($this->authorityCatalogUrl(), $this->authorityCatalogPublicKey());
+        return $this->compareAgainstAuthority($authorityCatalog);
+    }
+
+    /**
+     * Pulls one entry's data from the authority catalog into the local one —
+     * either replacing a local entry recorded as differing, or adding one
+     * recorded as missing, both keyed by the same entry identity. Signed and
+     * published like any other local catalog change; not a copy of the
+     * authority's signature, since Banquise only vouches for entries this
+     * instance actually curated.
+     */
+    public function syncEntryFromAuthority(string $entryId, string $password): string
+    {
+        if (!$this->authorityEnabled()) throw new RuntimeException('Configure and enable an authority catalog first.');
+        $statement = $this->db->prepare('SELECT authority_entry_json FROM catalog_authority_checks WHERE entry_id=?');
+        $statement->execute([$entryId]);
+        $json = $statement->fetchColumn();
+        if ($json === false) throw new InvalidArgumentException('No authority difference is on record for this entry; run Verify again.');
+        $authorityEntry = json_decode((string)$json, true);
+        if (!is_array($authorityEntry)) throw new RuntimeException('Stored authority entry is corrupted.');
+        $entry = $this->validateCatalogEntryFields($authorityEntry, ['last_release_at', 'last_commit_at']);
+        $catalog = $this->catalog();
+        $replaced = false;
+        foreach ($catalog['plugins'] as $index => $existing) {
+            if (hash_equals($this->catalogEntryId($existing), $entryId)) {
+                $catalog['plugins'][$index] = $entry;
+                $replaced = true;
+                break;
+            }
+        }
+        if (!$replaced) $catalog['plugins'][] = $entry;
+        $this->publishCatalogArray($catalog, $password); // also flips this row to 'verified' via pruneStaleAuthorityChecks()
+        return $replaced
+            ? 'Entry updated from the authority catalog, signed, and published.'
+            : 'Entry added from the authority catalog, signed, and published.';
+    }
+
+    /** @return array<string,string> local catalogEntryId() => 'verified'|'differs', for entries the authority has an opinion on. */
+    public function authorityStatus(): array
+    {
+        $map = [];
+        foreach ($this->db->query("SELECT entry_id, status FROM catalog_authority_checks WHERE status IN ('verified','differs')") as $row) {
+            $map[$row['entry_id']] = $row['status'];
+        }
+        return $map;
+    }
+
+    /** @return list<array{id:string,entry:array}> authority entries the local catalog doesn't have yet. */
+    public function authorityMissingEntries(): array
+    {
+        $entries = [];
+        foreach ($this->db->query("SELECT entry_id, authority_entry_json FROM catalog_authority_checks WHERE status='missing' ORDER BY entry_id") as $row) {
+            $decoded = json_decode((string)$row['authority_entry_json'], true);
+            if (is_array($decoded)) $entries[] = ['id' => $row['entry_id'], 'entry' => $decoded];
+        }
+        return $entries;
+    }
+
+    /** 'unknown' (never checked, or not enabled), 'verified' (everything matches), or 'differs' (at least one difference or missing entry). */
+    public function authorityOverallStatus(): string
+    {
+        if (!$this->authorityEnabled() || $this->authorityCheckedAt() === '') return 'unknown';
+        $count = (int)$this->db->query("SELECT COUNT(*) FROM catalog_authority_checks WHERE status<>'verified'")->fetchColumn();
+        return $count === 0 ? 'verified' : 'differs';
+    }
+
+    /** Whether $local and $authorityEntry represent the same build: same version and same file. */
+    private function authorityEntryMatches(array $local, array $authorityEntry): bool
+    {
+        return (string)($local['version'] ?? '') === (string)($authorityEntry['version'] ?? '')
+            && strtolower((string)($local['sha256'] ?? '')) === strtolower((string)($authorityEntry['sha256'] ?? ''));
+    }
+
+    /**
+     * Whether $a and $b are the same plugin build variant as far as
+     * cross-catalog comparison is concerned — same name/MariaDB
+     * version/architecture/soname, and either the same OS or one side
+     * simply doesn't record an OS at all. That last part mirrors
+     * catalogEntryUpgrades(): two catalogs can perfectly agree on a plugin
+     * while one of them predates OS tracking, and that shouldn't read as
+     * "two different plugins" any more than it does within one catalog.
+     * Unlike catalogEntryId(), this is deliberately not a hash — it's used
+     * to find a candidate match, not as a lookup key.
+     */
+    private function authorityEntryIdentityMatches(array $a, array $b): bool
+    {
+        foreach (['name', 'mariadb_version', 'architecture', 'soname'] as $field) {
+            if ((string)($a[$field] ?? '') !== (string)($b[$field] ?? '')) return false;
+        }
+        $aOs = (string)($a['os'] ?? '');
+        $bOs = (string)($b['os'] ?? '');
+        return $aOs === '' || $bOs === '' || $aOs === $bOs;
+    }
+
+    /**
+     * Fetches and verifies $url + $url.minisig against $publicKey purely to
+     * read and compare — unlike pullRemoteCatalog(), nothing here is ever
+     * written to the local catalog file.
+     */
+    private function fetchAuthorityCatalog(string $url, string $publicKey): array
+    {
+        $temporary = $this->temporaryCatalogPath();
+        $temporarySig = $temporary . '.minisig';
+        $temporaryKey = $temporary . '.pub';
+        try {
+            $this->downloadUrlToFile($url, $temporary);
+            $this->downloadUrlToFile($url . '.minisig', $temporarySig);
+            if (file_put_contents($temporaryKey, $publicKey . "\n") === false) {
+                throw new RuntimeException('Cannot stage the authority public key.');
+            }
+            [$code, , $stderr] = $this->runProcess(
+                ['minisign', '-V', '-q', '-p', $temporaryKey, '-m', $temporary, '-x', $temporarySig], ''
+            );
+            if ($code !== 0) throw new RuntimeException('Signature verification failed: ' . (trim($stderr) ?: "minisign exited $code"));
+            $decoded = json_decode((string)file_get_contents($temporary), true);
+            if (!is_array($decoded) || !is_array($decoded['plugins'] ?? null)) {
+                throw new RuntimeException('The downloaded file is not a valid Banquise catalog.');
+            }
+            return $decoded;
+        } finally {
+            foreach ([$temporary, $temporarySig, $temporaryKey] as $file) if (is_file($file)) unlink($file);
+        }
+    }
+
+    /**
+     * Compares the local catalog against $authorityCatalog by build-variant
+     * identity (see authorityEntryIdentityMatches()) and records a row for
+     * every entry either side has an opinion on: 'verified' or 'differs' for
+     * one both sides carry (keyed by the local entry's own id), 'missing'
+     * for one only the authority does (keyed by the authority entry's id).
+     * An entry only the local catalog carries gets no row — the authority
+     * has nothing to say about it. The table is rebuilt from scratch each run.
+     */
+    private function compareAgainstAuthority(array $authorityCatalog): string
+    {
+        $localEntries = array_values(array_filter($this->catalog()['plugins'] ?? [], 'is_array'));
+        $authorityEntries = array_values(array_filter($authorityCatalog['plugins'] ?? [], 'is_array'));
+        $claimed = [];
+        $verified = 0;
+        $differs = 0;
+        $missing = 0;
+        $now = self::now();
+        $this->db->beginTransaction();
+        try {
+            $this->db->exec('DELETE FROM catalog_authority_checks');
+            $insert = $this->db->prepare(
+                'INSERT INTO catalog_authority_checks(entry_id,status,authority_entry_json,checked_at) VALUES(?,?,?,?)'
+            );
+            foreach ($localEntries as $localEntry) {
+                $matchIndex = null;
+                foreach ($authorityEntries as $index => $authorityEntry) {
+                    if (isset($claimed[$index])) continue;
+                    if ($this->authorityEntryIdentityMatches($localEntry, $authorityEntry)) { $matchIndex = $index; break; }
+                }
+                if ($matchIndex === null) continue; // authority has no opinion on this one
+                $claimed[$matchIndex] = true;
+                $authorityEntry = $authorityEntries[$matchIndex];
+                $matches = $this->authorityEntryMatches($localEntry, $authorityEntry);
+                $matches ? $verified++ : $differs++;
+                $insert->execute([
+                    $this->catalogEntryId($localEntry), $matches ? 'verified' : 'differs',
+                    json_encode($authorityEntry, JSON_THROW_ON_ERROR), $now,
+                ]);
+            }
+            foreach ($authorityEntries as $index => $authorityEntry) {
+                if (isset($claimed[$index])) continue;
+                $missing++;
+                $insert->execute([$this->catalogEntryId($authorityEntry), 'missing', json_encode($authorityEntry, JSON_THROW_ON_ERROR), $now]);
+            }
+            $this->db->commit();
+        } catch (Throwable $e) {
+            $this->db->rollBack();
+            throw $e;
+        }
+        $this->setSetting('authority_checked_at', $now);
+        $parts = ["$verified verified"];
+        if ($differs) $parts[] = "$differs differ" . ($differs === 1 ? 's' : '');
+        if ($missing) $parts[] = "$missing only in the authority catalog";
+        return implode(', ', $parts) . '.';
+    }
+
+    /**
+     * Keeps authority-check rows accurate after a normal catalog edit that
+     * didn't go through syncEntryFromAuthority() — e.g. a manual edit that
+     * happens to land on the same version/sha256 as the authority's, a
+     * plugin added some other way that matches (or doesn't) a "missing"
+     * entry, or an entry that got deleted. Purely local, comparing against
+     * each row's own last-fetched authority_entry_json — no network fetch —
+     * so it stays current on every publish instead of only after the next
+     * explicit Verify.
+     */
+    private function pruneStaleAuthorityChecks(array $catalog): void
+    {
+        $rows = $this->db->query('SELECT entry_id, status, authority_entry_json FROM catalog_authority_checks')->fetchAll();
+        if (!$rows) return;
+        $localEntries = array_values(array_filter($catalog['plugins'] ?? [], 'is_array'));
+        $delete = [];
+        $updateStatus = $this->db->prepare('UPDATE catalog_authority_checks SET status=? WHERE entry_id=?');
+        foreach ($rows as $row) {
+            $authorityEntry = json_decode((string)$row['authority_entry_json'], true);
+            if (!is_array($authorityEntry)) { $delete[] = $row['entry_id']; continue; } // corrupted; a fresh Verify will restore it
+            $local = null;
+            foreach ($localEntries as $candidate) {
+                if ($this->authorityEntryIdentityMatches($candidate, $authorityEntry)) { $local = $candidate; break; }
+            }
+            $newStatus = $local === null ? 'missing' : ($this->authorityEntryMatches($local, $authorityEntry) ? 'verified' : 'differs');
+            if ($newStatus !== $row['status']) $updateStatus->execute([$newStatus, $row['entry_id']]);
+        }
+        if (!$delete) return;
+        $marks = implode(',', array_fill(0, count($delete), '?'));
+        $this->db->prepare("DELETE FROM catalog_authority_checks WHERE entry_id IN ($marks)")->execute($delete);
     }
 
     /**

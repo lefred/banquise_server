@@ -1,5 +1,7 @@
 # Banquise Server
 
+![banquise_server](public/assets/banquise_server_logo.png)
+
 Banquise Server is a small PHP 8.2+ control plane for managing signed MariaDB plugin catalogs and a fleet of `banquise_agent` instances. It uses SQLite (default/development) or MariaDB Server (preferred/production), a server-rendered administration interface, and a JSON HTTPS API with no PHP
 framework or JavaScript build chain.
 
@@ -253,6 +255,30 @@ Administrators can switch how MariaDB servers fetch the plugin *files* the signe
 Switching modes re-signs and republishes the catalog immediately so every entry matches — this needs the Minisign password unless the catalog is currently empty. Going private re-downloads and hashes every plugin file in the catalog, which can take a while for a large one; switching a single repository's builds happens automatically on every future publish too (edit, refresh, import, delete), so a plugin added after the fact is mirrored without needing to flip the mode again. If one repository can't be reached, that entry keeps serving from its original source and is named in the result — it doesn't hold up publishing the rest of the catalog, and is retried automatically on the next catalog change.
 
 The original GitHub URL is preserved internally (`origin_download_url`) for as long as an entry stays mirrored, so switching back to public restores it exactly rather than losing track of where a plugin actually came from.
+
+## External catalog
+
+Administrators can also point Banquise at another catalog instead of curating one locally, from Admin > Catalog source:
+
+- **Local management** (default) — this instance's Admin > Catalog panel controls the catalog, signed with its own Minisign key, as described above.
+- **External catalog** — Banquise fetches another catalog's `catalog.json` and `catalog.json.minisig` and verifies them against a Minisign public key uploaded here. Only once verification succeeds are the bytes copied into place, unmodified — the mirrored file keeps the *external* source's signature, so `/catalog.pub` also switches to serving that source's public key rather than this instance's own. Banquise never re-signs a mirrored catalog with its own key: it isn't vouching for entries it didn't curate, only relaying someone else's signed one.
+
+While external catalog mode is on, adding, editing, deleting, and refreshing plugins, checking for updates, and distribution mode are all disabled — there is nothing local to change, and rewriting `download_url` for private distribution would invalidate the external source's signature anyway. Mirroring itself is manual: use **Sync now** in the same panel to re-fetch on demand (there's no background scheduler). A sync that fails signature verification — a bad key, a tampered or unreachable source — leaves the previously mirrored catalog and stored key completely untouched; nothing is overwritten until a fetch actually verifies.
+
+Switching back to local management doesn't discard the external catalog URL/key or the last mirrored `catalog.json` — the mirrored entries stay visible (and installable) until a local add/edit/refresh re-signs the catalog with this instance's own key, and the URL/key are still there if external mode is turned back on later.
+
+## Authority verification
+
+While in local management, Admin > Authority verification adds an optional, non-destructive cross-check against another Banquise's catalog — unlike external catalog mode, nothing is ever adopted automatically. Enabling it takes the same URL + uploaded Minisign public key shape as external catalog mode, tested the same way before saving (a bad key never overwrites a good one).
+
+With it enabled, a **Verify** icon appears next to the catalog's refresh icon. Clicking it fetches and verifies the authority's catalog, then compares it against the local one by entry identity (name/MariaDB version/architecture/OS/soname) and records, for every entry either side has an opinion on, whether it's a clean match (same version and sha256) or not:
+
+- **Verified** (green) — a plugin card, or one row of its build-variant table, gets a small green "Verified" badge when the authority carries the exact same version/sha256.
+- **Not valid** (red) — a red "Not valid" badge instead, plus a small sync icon next to Edit/Refresh/Delete that opens a one-click "sync from authority" dialog: it replaces just that entry with the authority's copy, then signs and publishes with this instance's own key like any other local edit.
+- **Missing** — a plugin build the authority carries but the local catalog doesn't shows up in a banner above the catalog ("Review and add"), listing each with its own Add button.
+- **Local** (orange) — a local-only plugin the authority doesn't carry at all; not a problem, just a plain fact the badge makes visible.
+
+The Verify icon itself turns red if anything differs or is missing, green once everything matches. Verification is manual (no background scheduler), but a normal catalog edit — including "sync from authority" itself — updates the recorded status for that entry immediately using the authority snapshot from the last Verify, without waiting for (or requiring) another fetch.
 
 ## GitHub catalog import
 

@@ -121,3 +121,20 @@ CREATE TABLE IF NOT EXISTS catalog_update_checks (
   available_version TEXT NOT NULL,
   checked_at TEXT NOT NULL
 );
+
+-- Result of the last authority-verification pass (local management mode
+-- only): one row per entry the authority catalog has an opinion on —
+-- 'verified' (present on both sides, same version/sha256), 'differs'
+-- (present on both, different version/sha256), or 'missing' (the authority
+-- carries it, the local catalog doesn't). entry_id is the local entry's id
+-- for 'verified'/'differs', or the id computed the same way from the
+-- authority's own entry for 'missing'. A local-only entry the authority
+-- doesn't carry at all has no row here. authority_entry_json is the
+-- authority's copy of that entry, kept so "sync from authority" doesn't
+-- need to re-fetch.
+CREATE TABLE IF NOT EXISTS catalog_authority_checks (
+  entry_id TEXT PRIMARY KEY,
+  status TEXT NOT NULL CHECK(status IN ('verified','differs','missing')),
+  authority_entry_json TEXT NOT NULL,
+  checked_at TEXT NOT NULL
+);

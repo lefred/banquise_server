@@ -140,6 +140,23 @@ CREATE TABLE IF NOT EXISTS catalog_update_checks (
   checked_at VARCHAR(20) NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
+-- Result of the last authority-verification pass (local management mode
+-- only): one row per entry the authority catalog has an opinion on —
+-- 'verified' (present on both sides, same version/sha256), 'differs'
+-- (present on both, different version/sha256), or 'missing' (the authority
+-- carries it, the local catalog doesn't). entry_id is the local entry's id
+-- for 'verified'/'differs', or the id computed the same way from the
+-- authority's own entry for 'missing'. A local-only entry the authority
+-- doesn't carry at all has no row here. authority_entry_json is the
+-- authority's copy of that entry, kept so "sync from authority" doesn't
+-- need to re-fetch.
+CREATE TABLE IF NOT EXISTS catalog_authority_checks (
+  entry_id CHAR(64) NOT NULL PRIMARY KEY,
+  status ENUM('verified','differs','missing') NOT NULL,
+  authority_entry_json MEDIUMTEXT NOT NULL,
+  checked_at VARCHAR(20) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
 -- Restore the caller's original session settings.
 SET SQL_MODE=@OLD_SQL_MODE, FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS;
 SET UNIQUE_CHECKS=@OLD_UNIQUE_CHECKS, NOTE_VERBOSITY=@OLD_NOTE_VERBOSITY;

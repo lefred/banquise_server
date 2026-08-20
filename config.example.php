@@ -32,6 +32,11 @@ return [
     // public/artifacts/ so MariaDB servers never need internet access,
     // fetching from this server's own public_base_url instead.
     'distribution_mode' => 'public',
+    // Initial mode, also changeable from the web UI. 'local': this instance
+    // curates its own catalog. 'remote': it mirrors another catalog's
+    // catalog.json/.minisig verbatim instead (configured from the web UI,
+    // not here — there's no config key for the URL/public key).
+    'catalog_mode' => 'local',
     'session_name' => 'banquise_admin',
     // Keep this comfortably above the agents' poll interval.
     'online_threshold_seconds' => 180,

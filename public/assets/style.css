@@ -923,6 +923,10 @@ button.installation-count:disabled {
   padding: 24px;
 }
 
+.users-list-panel {
+  grid-column: 1 / -1;
+}
+
 .admin-panel > p,
 .admin-panel-title p {
   color: var(--muted);
@@ -1321,7 +1325,8 @@ button.installation-count:disabled {
   margin-top: 4px;
 }
 
-.legacy-duplicates-alert {
+.legacy-duplicates-alert,
+.authority-missing-alert {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -1389,4 +1394,110 @@ button.installation-count:disabled {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+}
+
+.catalog-verify-button.status-verified {
+  color: #08754b;
+  background: #e1f7ed;
+}
+
+.catalog-verify-button.status-verified:hover {
+  color: white;
+  background: #08754b;
+}
+
+.catalog-verify-button.status-differs {
+  color: #a33030;
+  background: #fde7e7;
+}
+
+.catalog-verify-button.status-differs:hover {
+  color: white;
+  background: #a33030;
+}
+
+.authority-badge {
+  position: absolute;
+  top: -10px;
+  left: 18px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 11px;
+  border-radius: 99px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  box-shadow: 0 4px 10px rgba(25, 61, 66, .12);
+}
+
+.authority-badge svg {
+  width: 11px;
+  height: 11px;
+  fill: currentColor;
+  flex-shrink: 0;
+}
+
+.authority-badge.status-verified {
+  background: #e1f7ed;
+  color: #08754b;
+}
+
+.authority-badge.status-differs {
+  background: #fde7e7;
+  color: #a33030;
+}
+
+.authority-badge.status-local {
+  background: #fff3d6;
+  color: #98670a;
+}
+
+.variant-table .authority-badge {
+  position: static;
+  box-shadow: none;
+}
+
+.authority-sync-button {
+  color: #a33030;
+  background: #fde7e7;
+}
+
+.authority-sync-button:hover {
+  color: white;
+  background: #a33030;
+}
+
+.authority-sync-button svg {
+  width: 14px;
+  height: 14px;
+  fill: currentColor;
+  vertical-align: -2px;
+}
+
+.authority-missing-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 15px;
+}
+
+.authority-missing-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+}
+
+.authority-missing-form {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.authority-missing-form input {
+  width: 160px;
 }

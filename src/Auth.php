@@ -25,6 +25,8 @@ final class BanquiseAuth
         'enrollment.manage' => ['administrator'],
         // Public/private catalog distribution mode.
         'distribution.manage' => ['administrator'],
+        // Local vs. external (read-only mirror) catalog source.
+        'catalog_source.manage' => ['administrator'],
     ];
 
     /** @param string[] $roles */

@@ -21,11 +21,19 @@ if (str_starts_with($path, '/api/')) (new BanquiseApi($app))->dispatch($_SERVER[
 if ($path === '/catalog.pub') {
     // Public by design, like /catalog.json and /catalog.json.minisig: this is
     // the Minisign public key needed to verify the signed catalog, not a secret.
-    $publicKeyFile = (string)($app->config['catalog_public_key'] ?? '');
-    if ($publicKeyFile === '' || !is_readable($publicKeyFile)) { http_response_code(404); exit('Catalog public key is not available.'); }
+    // In external catalog mode, catalog.json is a verbatim mirror signed by
+    // the external source's own key, so that's the key agents must use here.
     header('Content-Type: text/plain; charset=utf-8');
     header('Content-Disposition: attachment; filename="catalog.pub"');
     header('Cache-Control: public, max-age=3600');
+    if ($app->catalogMode() === 'remote') {
+        $remoteKey = $app->remoteCatalogPublicKey();
+        if ($remoteKey === '') { http_response_code(404); exit('External catalog public key is not available.'); }
+        echo rtrim($remoteKey, "\n") . "\n";
+        exit;
+    }
+    $publicKeyFile = (string)($app->config['catalog_public_key'] ?? '');
+    if ($publicKeyFile === '' || !is_readable($publicKeyFile)) { http_response_code(404); exit('Catalog public key is not available.'); }
     readfile($publicKeyFile);
     exit;
 }
@@ -122,6 +130,11 @@ $canReviewSubmissions = $auth->can('submissions.review');
 $canManageUsers = $auth->can('users.manage');
 $canManageEnrollment = $auth->can('enrollment.manage');
 $canManageDistribution = $auth->can('distribution.manage');
+$canManageCatalogSource = $auth->can('catalog_source.manage');
+$catalogMode = $app->catalogMode();
+// Capability plus mode: even a plugin manager can't add/edit/delete/refresh
+// while the catalog is a verbatim mirror of an external source.
+$canEditCatalogNow = $canWriteCatalog && $catalogMode === 'local';
 
 if ($auth->isAuthenticated() && $_SERVER['REQUEST_METHOD'] === 'POST'
     && !in_array((string)($_POST['form'] ?? ''), ['login', 'submit_plugin', 'complete_setup'], true)) {
@@ -222,6 +235,38 @@ if ($auth->isAuthenticated() && $_SERVER['REQUEST_METHOD'] === 'POST'
                 $auth->require('distribution.manage');
                 $message = $app->setDistributionMode((string)($_POST['mode'] ?? ''), (string)($_POST['signing_password'] ?? ''));
                 break;
+            case 'catalog_source':
+                $auth->require('catalog_source.manage');
+                $remoteUrl = trim((string)($_POST['remote_catalog_url'] ?? ''));
+                if ($remoteUrl === '') $remoteUrl = $app->remoteCatalogUrl(); // keep the existing one if left blank
+                $remoteKey = $app->remoteCatalogPublicKey(); // keep the existing key unless a new file was uploaded
+                if (isset($_FILES['remote_catalog_public_key']) && $_FILES['remote_catalog_public_key']['error'] === UPLOAD_ERR_OK) {
+                    $remoteKey = (string)file_get_contents($_FILES['remote_catalog_public_key']['tmp_name']);
+                }
+                $message = $app->setCatalogSource((string)($_POST['catalog_mode'] ?? 'local'), $remoteUrl, $remoteKey);
+                break;
+            case 'catalog_source_sync':
+                $auth->require('catalog_source.manage');
+                $message = $app->syncRemoteCatalog();
+                break;
+            case 'authority_source':
+                $auth->require('catalog_source.manage');
+                $authorityUrl = trim((string)($_POST['authority_catalog_url'] ?? ''));
+                if ($authorityUrl === '') $authorityUrl = $app->authorityCatalogUrl(); // keep the existing one if left blank
+                $authorityKey = $app->authorityCatalogPublicKey(); // keep the existing key unless a new file was uploaded
+                if (isset($_FILES['authority_catalog_public_key']) && $_FILES['authority_catalog_public_key']['error'] === UPLOAD_ERR_OK) {
+                    $authorityKey = (string)file_get_contents($_FILES['authority_catalog_public_key']['tmp_name']);
+                }
+                $message = $app->setAuthoritySource(!empty($_POST['authority_enabled']), $authorityUrl, $authorityKey);
+                break;
+            case 'authority_verify':
+                $auth->require('catalog.write');
+                $message = $app->checkAgainstAuthority();
+                break;
+            case 'authority_sync_entry':
+                $auth->require('catalog.write');
+                $message = $app->syncEntryFromAuthority((string)($_POST['entry_id'] ?? ''), (string)($_POST['signing_password'] ?? ''));
+                break;
             case 'enrollment_generate':
                 $auth->require('enrollment.manage');
                 $created = $app->generateEnrollmentTokens((int)($_POST['count'] ?? 0));
@@ -275,9 +320,11 @@ if ($auth->isAuthenticated() && $_SERVER['REQUEST_METHOD'] === 'POST'
     $submissionId = (string)($_POST['submission_id'] ?? '');
     if ($uid !== '' && $form !== 'agent_delete') {
         $redirect = '/?agent=' . rawurlencode($uid) . '#server-detail';
-    } elseif (str_starts_with($form, 'catalog_') || str_starts_with($form, 'repository')) {
+    } elseif ((str_starts_with($form, 'catalog_') && !str_starts_with($form, 'catalog_source')) || str_starts_with($form, 'repository')
+        || $form === 'authority_verify' || $form === 'authority_sync_entry') {
         $redirect = '/#catalog';
-    } elseif (str_starts_with($form, 'enrollment_') || str_starts_with($form, 'user_') || $form === 'distribution_mode') {
+    } elseif (str_starts_with($form, 'enrollment_') || str_starts_with($form, 'user_') || $form === 'distribution_mode'
+        || str_starts_with($form, 'catalog_source') || $form === 'authority_source') {
         $redirect = '/?page=admin#admin';
     } elseif (str_starts_with($form, 'submission_') && $submissionId !== '') {
         $redirect = '/?page=submissions&submission=' . rawurlencode($submissionId) . '#submissions';
@@ -323,6 +370,30 @@ function submissionStatusLabel(string $status): string
         'denied' => 'Denied', 'spam' => 'Spam', default => ucfirst($status),
     };
 }
+/** 'verified', 'differs', or 'local' (authority has no opinion) -> the badge markup shown on a plugin card / variant row. */
+function authorityBadge(string $status): string
+{
+    if ($status === 'verified') {
+        return '<span class="authority-badge status-verified" title="Matches the authority catalog">'
+            . '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm-1.2 14.4L6.4 12l1.4-1.4 2.9 2.9 5.4-5.4L17.5 9.5l-6.7 6.9Z"/></svg>'
+            . 'Verified</span>';
+    }
+    if ($status === 'differs') {
+        return '<span class="authority-badge status-differs" title="Differs from the authority catalog">'
+            . '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm3.5 12.1-1.4 1.4L12 13.4l-2.1 2.1-1.4-1.4L10.6 12 8.5 9.9l1.4-1.4L12 10.6l2.1-2.1 1.4 1.4L13.4 12l2.1 2.1Z"/></svg>'
+            . 'Not valid</span>';
+    }
+    return '<span class="authority-badge status-local" title="The authority catalog doesn\'t carry this plugin">'
+        . '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5.25 7 13 7 13s7-7.75 7-13a7 7 0 0 0-7-7Zm0 9.5A2.5 2.5 0 1 1 12 6.5a2.5 2.5 0 0 1 0 5Z"/></svg>'
+        . 'Local</span>';
+}
+/** The "sync this entry from the authority" icon button, opening the matching dialog. */
+function authoritySyncButton(string $entryId): string
+{
+    return '<button type="button" class="small secondary authority-sync-button" data-dialog="authority-sync-' . h($entryId) . '" '
+        . 'title="Sync this entry from the authority catalog" aria-label="Sync from authority">'
+        . '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h11l-2.5-2.5L17 3l5 5-5 5-1.5-1.5L18 9H7a3 3 0 0 0 0 6h3v2H7a5 5 0 0 1 0-10Zm10 10H6l2.5 2.5L7 21l-5-5 5-5 1.5 1.5L6 15h11a3 3 0 0 0 0-6h-3V7h3a5 5 0 0 1 0 10Z"/></svg></button>';
+}
 /** "2 days", "1 year", "just now" — for the visible label; pair with fullDate() for the title. */
 function relativeTime(?string $isoDate): string
 {
@@ -357,14 +428,21 @@ $pluginUpdates = $agents ? $app->pluginUpdatesByServer($catalog) : [];
 $pluginCounts = $agents ? $app->pluginCountsByServer($catalog, $agents) : [];
 $selectedUid = ($canViewFleet && $isDashboard) ? (string)($_GET['agent'] ?? '') : '';
 $selected = $selectedUid !== '' ? $app->agent($selectedUid) : null;
-$prefillSubmission = ($isDashboard && $canWriteCatalog && isset($_GET['submission_id']))
+$prefillSubmission = ($isDashboard && $canEditCatalogNow && isset($_GET['submission_id']))
     ? $app->submission((int)$_GET['submission_id']) : null;
 $reopenSubmissionId = ($isSubmissionsPage && $canReviewSubmissions && isset($_GET['submission']))
     ? (int)$_GET['submission'] : 0;
-$catalogPreview = ($isDashboard && $canWriteCatalog) ? ($_SESSION['catalog_preview'] ?? null) : null;
-$legacyDuplicates = ($isDashboard && $canWriteCatalog) ? $app->legacyDuplicateEntries() : [];
+$catalogPreview = ($isDashboard && $canEditCatalogNow) ? ($_SESSION['catalog_preview'] ?? null) : null;
+$legacyDuplicates = ($isDashboard && $canEditCatalogNow) ? $app->legacyDuplicateEntries() : [];
 $newSubmissionCount = $canReviewSubmissions ? $app->newSubmissionCount() : 0;
-$updateAvailability = ($isDashboard && $canWriteCatalog) ? $app->pluginUpdateAvailability() : [];
+$updateAvailability = ($isDashboard && $canEditCatalogNow) ? $app->pluginUpdateAvailability() : [];
+// Read-only visibility (badges): anyone viewing the catalog, logged in or
+// not. Acting on it (Verify, sync, the "available from authority" banner)
+// stays restricted to $canEditCatalogNow, gated separately below.
+$authorityActive = $isDashboard ? $app->authorityEnabled() : false;
+$authorityStatus = $authorityActive ? $app->authorityStatus() : [];
+$authorityMissing = ($authorityActive && $canEditCatalogNow) ? $app->authorityMissingEntries() : [];
+$authorityOverallStatus = $authorityActive ? $app->authorityOverallStatus() : 'unknown';
 ?>
 <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Banquise</title><link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" sizes="any"><link rel="stylesheet" href="/assets/style.css"></head><body>
@@ -388,7 +466,7 @@ $updateAvailability = ($isDashboard && $canWriteCatalog) ? $app->pluginUpdateAva
 <?php else: ?>
 <?php if (!$isDashboard): ?><a href="/">Dashboard</a><?php else: ?><a href="#catalog">Catalog</a><?php if ($canViewFleet): ?><a href="#servers">Servers</a><?php endif; ?><?php endif; ?>
 <?php if ($canReviewSubmissions): ?><a class="nav-link-with-badge" href="?page=submissions">Submissions<?php if ($newSubmissionCount): ?><span class="nav-badge"><?=h($newSubmissionCount)?></span><?php endif; ?></a><?php endif; ?>
-<?php if ($canManageEnrollment || $canManageUsers): ?><a href="?page=admin">Admin</a><?php endif; ?>
+<?php if ($canManageEnrollment || $canManageUsers || $canManageDistribution || $canManageCatalogSource): ?><a href="?page=admin">Admin</a><?php endif; ?>
 <a href="?logout=1">Sign out</a>
 <?php endif; ?></nav></header>
 <main class="shell"><?php if ($message): ?><div class="alert"><?=nl2br(h($message))?></div><?php endif; ?>
@@ -490,7 +568,8 @@ foreach(($catalog['plugins']??[]) as $catalogPlugin) {
 }
 asort($catalogTypes,SORT_NATURAL|SORT_FLAG_CASE); asort($catalogMaturities,SORT_NATURAL|SORT_FLAG_CASE);
 $catalogPublicUrl=rtrim((string)($app->config['public_base_url']??''),'/').'/catalog.json';
-$catalogKeyId=$app->expectedKeyId();
+// Only used as a boolean gate for showing the "download public key" button below.
+$catalogKeyId = $catalogMode === 'remote' ? $app->remoteCatalogPublicKey() : $app->expectedKeyId();
 
 // Group build variants of the same plugin (name + repository) under one
 // card instead of one card per OS/MariaDB-version/architecture combination.
@@ -503,10 +582,12 @@ foreach(($catalog['plugins']??[]) as $plugin) {
 }
 ?>
 
-<section id="catalog" data-catalog-filter-root><div class="section-title"><div><span class="eyebrow">SIGNED ARTIFACTS</span><div class="catalog-title"><h2>Plugin catalog</h2><button type="button" class="catalog-copy-button" data-copy-catalog-url="<?=h($catalogPublicUrl)?>" title="Copy catalog URL" aria-label="Copy catalog URL"><svg class="copy-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7V4.8C8 3.8 8.8 3 9.8 3h9.4c1 0 1.8.8 1.8 1.8v9.4c0 1-.8 1.8-1.8 1.8H17v2.2c0 1-.8 1.8-1.8 1.8H5.8c-1 0-1.8-.8-1.8-1.8V8.8C4 7.8 4.8 7 5.8 7H8Zm2 0h5.2c1 0 1.8.8 1.8 1.8V14h2V5h-9v2Zm-4 2v9h9V9H6Z"/></svg><svg class="copy-done-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m9.2 16.2-4.4-4.4 1.8-1.8 2.6 2.6 8.2-8.2 1.8 1.8-10 10Z"/></svg></button><?php if ($catalogKeyId !== ''): ?><a class="catalog-key-button" href="/catalog.pub" download="catalog.pub" title="Download catalog public key" aria-label="Download catalog public key"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 3h2v10.2l3.6-3.6 1.4 1.4-6 6-6-6 1.4-1.4L11 13.2V3ZM5 19h14v2H5v-2Z"/></svg></a><?php endif; ?></div></div>
-<?php if ($canWriteCatalog): ?><div class="catalog-header-actions"><form method="post" data-spin-on-submit><input type="hidden" name="csrf" value="<?=csrf()?>"><input type="hidden" name="form" value="catalog_check_updates"><button type="submit" class="catalog-refresh-button" title="Check every catalog plugin's repository for a newer GitHub release" aria-label="Check for plugin updates"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5V2L8 6l4 4V7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.35 1.83l1.46 1.46A6.93 6.93 0 0 0 19 12c0-3.87-3.13-7-7-7Zm0 12c-2.76 0-5-2.24-5-5 0-.65.13-1.26.35-1.83L5.89 8.71A6.93 6.93 0 0 0 5 12c0 3.87 3.13 7 7 7v3l4-4-4-4v3Z"/></svg></button></form><button type="button" data-dialog="repo-dialog">Add GitHub repository</button></div>
+<section id="catalog" data-catalog-filter-root><div class="section-title"><div><span class="eyebrow">SIGNED ARTIFACTS</span><div class="catalog-title"><h2>Plugin catalog</h2><?php if ($catalogMode === 'remote'): ?><span class="badge neutral" title="Mirrored verbatim from an external catalog; local additions, edits, and updates are disabled.">External catalog</span><?php endif; ?><button type="button" class="catalog-copy-button" data-copy-catalog-url="<?=h($catalogPublicUrl)?>" title="Copy catalog URL" aria-label="Copy catalog URL"><svg class="copy-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7V4.8C8 3.8 8.8 3 9.8 3h9.4c1 0 1.8.8 1.8 1.8v9.4c0 1-.8 1.8-1.8 1.8H17v2.2c0 1-.8 1.8-1.8 1.8H5.8c-1 0-1.8-.8-1.8-1.8V8.8C4 7.8 4.8 7 5.8 7H8Zm2 0h5.2c1 0 1.8.8 1.8 1.8V14h2V5h-9v2Zm-4 2v9h9V9H6Z"/></svg><svg class="copy-done-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m9.2 16.2-4.4-4.4 1.8-1.8 2.6 2.6 8.2-8.2 1.8 1.8-10 10Z"/></svg></button><?php if ($catalogKeyId !== ''): ?><a class="catalog-key-button" href="/catalog.pub" download="catalog.pub" title="Download catalog public key" aria-label="Download catalog public key"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 3h2v10.2l3.6-3.6 1.4 1.4-6 6-6-6 1.4-1.4L11 13.2V3ZM5 19h14v2H5v-2Z"/></svg></a><?php endif; ?></div></div>
+<?php if ($canEditCatalogNow): ?><div class="catalog-header-actions"><?php if ($authorityActive): ?><form method="post" data-spin-on-submit><input type="hidden" name="csrf" value="<?=csrf()?>"><input type="hidden" name="form" value="authority_verify"><button type="submit" class="catalog-refresh-button catalog-verify-button status-<?=h($authorityOverallStatus)?>" title="Verify the catalog against the authority" aria-label="Verify against authority"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 4 5v6c0 5 3.4 9.4 8 11 4.6-1.6 8-6 8-11V5l-8-3Zm-1.2 14L6.8 12l1.4-1.4 2.6 2.6 5.6-5.6 1.4 1.4-7 7Z"/></svg></button></form><?php endif; ?><form method="post" data-spin-on-submit><input type="hidden" name="csrf" value="<?=csrf()?>"><input type="hidden" name="form" value="catalog_check_updates"><button type="submit" class="catalog-refresh-button" title="Check every catalog plugin's repository for a newer GitHub release" aria-label="Check for plugin updates"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5V2L8 6l4 4V7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.35 1.83l1.46 1.46A6.93 6.93 0 0 0 19 12c0-3.87-3.13-7-7-7Zm0 12c-2.76 0-5-2.24-5-5 0-.65.13-1.26.35-1.83L5.89 8.71A6.93 6.93 0 0 0 5 12c0 3.87 3.13 7 7 7v3l4-4-4-4v3Z"/></svg></button></form><button type="button" data-dialog="repo-dialog">Add GitHub repository</button></div>
+<?php elseif ($canWriteCatalog): ?><p class="form-note">This catalog is mirrored from an external source; local catalog management is disabled. <?php if ($canManageCatalogSource): ?><a href="?page=admin#admin">Change the catalog source</a>.<?php endif; ?></p>
 <?php elseif (!$auth->isAuthenticated()): ?><button type="button" data-dialog="submit-plugin-dialog">Submit a plugin</button><?php endif; ?></div>
 <?php if ($legacyDuplicates): ?><div class="alert legacy-duplicates-alert">Found <?=count($legacyDuplicates)?> catalog entr<?=count($legacyDuplicates)===1?'y':'ies'?> that predate OS tracking and now duplicate a newer, OS-tagged entry for the same plugin — leftover from before Banquise could tell them apart. <button type="button" class="small secondary" data-dialog="prune-duplicates-dialog">Review and clean up</button></div><?php endif; ?>
+<?php if ($authorityMissing): ?><div class="alert authority-missing-alert">Found <?=count($authorityMissing)?> plugin build<?=count($authorityMissing)===1?'':'s'?> in the authority catalog that <?=count($authorityMissing)===1?'isn\'t':'aren\'t'?> in yours yet. <button type="button" class="small secondary" data-dialog="authority-missing-dialog">Review and add</button></div><?php endif; ?>
 <?php if($catalog['plugins']??[]): ?><div class="catalog-filters"><div class="catalog-filter-top">
 <?php if($catalogTypes): ?><div class="filter-group"><span class="filter-label">Type</span><div class="filter-chips"><?php foreach($catalogTypes as $value=>$label): ?><button type="button" class="filter-chip" data-catalog-filter data-filter-group="type" data-filter-value="<?=h($value)?>" aria-pressed="false"><?=h($label)?></button><?php endforeach; ?></div></div><?php endif; ?>
 <label class="catalog-search"><span>Search</span><input type="search" data-catalog-search placeholder="Search plugins…" autocomplete="off"></label></div>
@@ -537,14 +618,22 @@ foreach(($catalog['plugins']??[]) as $plugin) {
     sort($architectures,SORT_NATURAL|SORT_FLAG_CASE);
     $hasUpdate=false;
     foreach($variants as $variant) { if(isset($updateAvailability[$app->catalogEntryId($variant)])) { $hasUpdate=true; break; } }
-?><article class="plugin card" data-catalog-entry data-search-text="<?=h($catalogSearchText)?>" data-filter-types="<?=h(json_encode($filterTypes,JSON_THROW_ON_ERROR))?>" data-filter-maturity="<?=h($filterMaturity)?>"><?php if($hasUpdate): ?><span class="plugin-update-badge">Update available</span><?php endif; ?><div><h3><a class="plugin-repository-link" href="<?=h($first['repository'])?>" target="_blank" rel="noopener noreferrer"><?=h($first['name'])?><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6h-2V7.4l-7.3 7.3-1.4-1.4L16.6 6H14V4ZM5 6h6v2H7v9h9v-4h2v6H5V6Z"/></svg><span class="visually-hidden"> repository</span></a></h3><p><?=h($first['description']??'')?></p><?php if ($canWriteCatalog && !$isMulti): ?><div class="plugin-actions"><button type="button" class="small secondary" data-dialog="edit-<?=h($groupEntryId)?>">Edit</button><button type="button" class="small secondary" data-dialog="refresh-<?=h($groupEntryId)?>">Refresh from GitHub</button><button type="button" class="small danger" data-dialog="delete-<?=h($groupEntryId)?>">Delete</button></div><?php endif; ?></div>
+    $authorityCardStatus=null; // null = authority has no opinion; 'differs' wins over 'verified' when variants disagree
+    if ($authorityActive) {
+        foreach($variants as $variant) {
+            $variantStatus=$authorityStatus[$app->catalogEntryId($variant)]??null;
+            if ($variantStatus==='differs') { $authorityCardStatus='differs'; break; }
+            if ($variantStatus==='verified' && $authorityCardStatus===null) $authorityCardStatus='verified';
+        }
+    }
+?><article class="plugin card" data-catalog-entry data-search-text="<?=h($catalogSearchText)?>" data-filter-types="<?=h(json_encode($filterTypes,JSON_THROW_ON_ERROR))?>" data-filter-maturity="<?=h($filterMaturity)?>"><?php if($hasUpdate): ?><span class="plugin-update-badge">Update available</span><?php endif; ?><?php if($authorityActive): ?><?=authorityBadge($authorityCardStatus??'local')?><?php endif; ?><div><h3><a class="plugin-repository-link" href="<?=h($first['repository'])?>" target="_blank" rel="noopener noreferrer"><?=h($first['name'])?><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6h-2V7.4l-7.3 7.3-1.4-1.4L16.6 6H14V4ZM5 6h6v2H7v9h9v-4h2v6H5V6Z"/></svg><span class="visually-hidden"> repository</span></a></h3><p><?=h($first['description']??'')?></p><?php if ($canEditCatalogNow && !$isMulti): ?><div class="plugin-actions"><button type="button" class="small secondary" data-dialog="edit-<?=h($groupEntryId)?>">Edit</button><?php if ($authorityCardStatus==='differs'): ?><?=authoritySyncButton($groupEntryId)?><?php endif; ?><button type="button" class="small secondary" data-dialog="refresh-<?=h($groupEntryId)?>">Refresh from GitHub</button><button type="button" class="small danger" data-dialog="delete-<?=h($groupEntryId)?>">Delete</button></div><?php endif; ?></div>
 
 <?php if ($isMulti): ?>
 <dl><div><dt>MariaDB versions</dt><dd><?=h(implode(', ',$mariadbVersions))?></dd></div><?php if($osValues): ?><div><dt>OS builds</dt><dd><?=h(implode(', ',$osValues))?></dd></div><?php endif; ?><div><dt>Type</dt><dd><?=h($first['plugin_types']??'')?></dd></div><?php if(count($architectures)>1): ?><div><dt>Architectures</dt><dd><?=h(implode(', ',$architectures))?></dd></div><?php endif; ?><?php if(!empty($first['author'])): ?><div><dt>Author</dt><dd><a href="https://github.com/<?=h($first['author'])?>" target="_blank" rel="noopener noreferrer"><?=h($first['author'])?></a></dd></div><?php endif; ?><?php if ($auth->isAuthenticated()): ?><div><dt>Installed on</dt><dd><?php if ($canViewFleet): ?><button type="button" class="installation-count" <?=$pluginServers?'data-dialog="installed-'.$groupEntryId.'"':'disabled'?>><strong><?=count($pluginServers)?></strong> server<?=count($pluginServers)===1?'':'s'?></button><?php else: ?><?=count($pluginServers)?> server<?=count($pluginServers)===1?'':'s'?><?php endif; ?></dd></div><?php else: ?><div aria-hidden="true"></div><?php endif; ?><div><dt>Maturity</dt><dd><span class="badge neutral"><?=h($first['maturity']??'unknown')?></span></dd></div></dl>
 
 <details class="plugin-variants"><summary><?=count($variants)?> build variants</summary>
-<div class="variant-table-wrap"><table class="variant-table"><thead><tr><th>Version</th><th>MariaDB</th><th>Architecture</th><th>OS</th><th>Last release</th><th>Last commit</th><?php if($canWriteCatalog): ?><th></th><?php endif; ?></tr></thead><tbody>
-<?php foreach($variants as $variant): $variantEntryId=$app->catalogEntryId($variant); ?><tr><td><?=h($variant['version'])?></td><td><?=h($variant['mariadb_version'])?></td><td><?=h($variant['architecture'])?></td><td><?=h($variant['os']??'—')?></td><td><?php if(!empty($variant['last_release_at'])): ?><span title="<?=h(fullDate($variant['last_release_at']))?>"><?=h(relativeTime($variant['last_release_at']))?></span><?php else: ?>—<?php endif; ?></td><td><?php if(!empty($variant['last_commit_at'])): ?><span title="<?=h(fullDate($variant['last_commit_at']))?>"><?=h(relativeTime($variant['last_commit_at']))?></span><?php else: ?>—<?php endif; ?></td><?php if($canWriteCatalog): ?><td><div class="variant-actions"><button type="button" class="small secondary" data-dialog="edit-<?=h($variantEntryId)?>">Edit</button><button type="button" class="small secondary" data-dialog="refresh-<?=h($variantEntryId)?>">Refresh</button><button type="button" class="small danger" data-dialog="delete-<?=h($variantEntryId)?>">Delete</button></div></td><?php endif; ?></tr><?php endforeach; ?>
+<div class="variant-table-wrap"><table class="variant-table"><thead><tr><th>Version</th><th>MariaDB</th><th>Architecture</th><th>OS</th><th>Last release</th><th>Last commit</th><?php if($authorityActive): ?><th>Authority</th><?php endif; ?><?php if($canEditCatalogNow): ?><th></th><?php endif; ?></tr></thead><tbody>
+<?php foreach($variants as $variant): $variantEntryId=$app->catalogEntryId($variant); $variantAuthorityStatus=$authorityStatus[$variantEntryId]??null; ?><tr><td><?=h($variant['version'])?></td><td><?=h($variant['mariadb_version'])?></td><td><?=h($variant['architecture'])?></td><td><?=h($variant['os']??'—')?></td><td><?php if(!empty($variant['last_release_at'])): ?><span title="<?=h(fullDate($variant['last_release_at']))?>"><?=h(relativeTime($variant['last_release_at']))?></span><?php else: ?>—<?php endif; ?></td><td><?php if(!empty($variant['last_commit_at'])): ?><span title="<?=h(fullDate($variant['last_commit_at']))?>"><?=h(relativeTime($variant['last_commit_at']))?></span><?php else: ?>—<?php endif; ?></td><?php if($authorityActive): ?><td><?=authorityBadge($variantAuthorityStatus??'local')?></td><?php endif; ?><?php if($canEditCatalogNow): ?><td><div class="variant-actions"><button type="button" class="small secondary" data-dialog="edit-<?=h($variantEntryId)?>">Edit</button><?php if($variantAuthorityStatus==='differs'): ?><?=authoritySyncButton($variantEntryId)?><?php endif; ?><button type="button" class="small secondary" data-dialog="refresh-<?=h($variantEntryId)?>">Refresh</button><button type="button" class="small danger" data-dialog="delete-<?=h($variantEntryId)?>">Delete</button></div></td><?php endif; ?></tr><?php endforeach; ?>
 </tbody></table></div></details>
 <?php else: ?>
 <dl><div><dt>Version</dt><dd><?=h($first['version'])?></dd></div><div><dt>MariaDB</dt><dd><?=h($first['mariadb_version'])?></dd></div><div><dt>Architecture</dt><dd><?=h($first['architecture'])?></dd></div><?php if(!empty($first['os'])): ?><div><dt>OS</dt><dd><?=h($first['os'])?></dd></div><?php endif; ?><div><dt>Type</dt><dd><?=h($first['plugin_types']??'')?></dd></div><?php if(!empty($first['author'])): ?><div><dt>Author</dt><dd><a href="https://github.com/<?=h($first['author'])?>" target="_blank" rel="noopener noreferrer"><?=h($first['author'])?></a></dd></div><?php endif; ?><?php if(!empty($first['last_release_at'])): ?><div><dt>Last release</dt><dd><span title="<?=h(fullDate($first['last_release_at']))?>"><?=h(relativeTime($first['last_release_at']))?></span></dd></div><?php endif; ?><?php if(!empty($first['last_commit_at'])): ?><div><dt>Last commit</dt><dd><span title="<?=h(fullDate($first['last_commit_at']))?>"><?=h(relativeTime($first['last_commit_at']))?></span></dd></div><?php endif; ?><?php if ($auth->isAuthenticated()): ?><div><dt>Installed on</dt><dd><?php if ($canViewFleet): ?><button type="button" class="installation-count" <?=$pluginServers?'data-dialog="installed-'.$groupEntryId.'"':'disabled'?>><strong><?=count($pluginServers)?></strong> server<?=count($pluginServers)===1?'':'s'?></button><?php else: ?><?=count($pluginServers)?> server<?=count($pluginServers)===1?'':'s'?><?php endif; ?></dd></div><?php else: ?><div aria-hidden="true"></div><?php endif; ?><div><dt>Maturity</dt><dd><span class="badge neutral"><?=h($first['maturity']??'unknown')?></span></dd></div></dl>
@@ -553,7 +642,7 @@ foreach(($catalog['plugins']??[]) as $plugin) {
 
 <?php if($canViewFleet && $pluginServers): ?><dialog id="installed-<?=h($groupEntryId)?>" class="installation-dialog"><div class="dialog-content"><div class="dialog-title"><div><span class="eyebrow">INSTALLATIONS</span><h2><?=h($first['name'])?></h2></div><button type="button" class="icon" data-close>×</button></div><p>Servers currently reporting this plugin as installed, regardless of installed version or which build variant.</p><div class="installation-list"><?php foreach($pluginServers as $pluginServer): ?><a href="?agent=<?=rawurlencode($pluginServer['server_uid'])?>#server-detail" class="installation-server"><span class="database-icon"><img src="/assets/database-node.svg" alt=""></span><span class="installation-server-name"><strong><?=h($pluginServer['display_name']?:$pluginServer['server_uid'])?></strong><small><?=h($pluginServer['server_uid'])?></small></span><span><small>Installed version</small><strong><?=h($pluginServer['installed_version']?:'Unknown')?></strong></span><span><small>Runtime</small><strong class="presence"><span class="dot <?=!empty($pluginServer['loaded'])?'up':'down'?>"></span><?=!empty($pluginServer['loaded'])?'Loaded':'Not loaded'?></strong></span><span class="badge <?=h($pluginServer['status'])?>"><?=h($pluginServer['status'])?></span></a><?php endforeach; ?></div></div></dialog><?php endif; ?>
 
-<?php if ($canWriteCatalog): foreach($variants as $variant): $variantEntryId=$app->catalogEntryId($variant); ?>
+<?php if ($canEditCatalogNow): foreach($variants as $variant): $variantEntryId=$app->catalogEntryId($variant); ?>
 <dialog id="edit-<?=h($variantEntryId)?>"><form method="post" class="stack catalog-editor"><div class="dialog-title"><h2>Edit <?=h($variant['name'])?></h2><button type="button" class="icon" data-close>×</button></div><input type="hidden" name="csrf" value="<?=csrf()?>"><input type="hidden" name="form" value="catalog_edit"><input type="hidden" name="entry_id" value="<?=h($variantEntryId)?>">
 <div class="form-grid"><label>Name<input name="name" value="<?=h($variant['name'])?>" required></label><label>Version<input name="version" value="<?=h($variant['version'])?>" required></label><label>MariaDB version<input name="mariadb_version" value="<?=h($variant['mariadb_version'])?>" required></label><label>Architecture<input name="architecture" value="<?=h($variant['architecture'])?>" required></label><label>OS<input name="os" value="<?=h($variant['os']??'')?>" placeholder="linux, el8, ubuntu24.04…"></label><label>Soname<input name="soname" value="<?=h($variant['soname'])?>" required></label><label>Plugin types<input name="plugin_types" value="<?=h($variant['plugin_types']??'')?>"></label><label>License<input name="license" value="<?=h($variant['license']??'')?>"></label><label>Maturity<input name="maturity" value="<?=h($variant['maturity']??'')?>"></label><label>Author<input name="author" value="<?=h($variant['author']??'')?>"></label></div>
 <label>Repository<input type="url" name="repository" value="<?=h($variant['repository'])?>" required></label><label>Download URL<input type="url" name="download_url" value="<?=h($variant['download_url'])?>" required></label><label>SHA-256<input name="sha256" value="<?=h($variant['sha256'])?>" minlength="64" maxlength="64" required></label><div class="form-grid"><label>Archive type<input name="archive_type" value="<?=h($variant['archive_type']??'')?>" placeholder="tar.gz"></label><label>Archive member<input name="archive_member" value="<?=h($variant['archive_member']??'')?>"></label></div><label>Description<input name="description" value="<?=h($variant['description']??'')?>"></label><label>Dependencies<input name="dependencies" value="<?=h($variant['dependencies']??'')?>"></label><label>Install message<textarea name="message"><?=h($variant['message']??'')?></textarea></label><label>Minisign key password<input type="password" name="signing_password" autocomplete="current-password" required><small>The live catalog changes only after signing and verification succeed.</small></label><button>Save, sign, and publish</button></form></dialog>
@@ -561,18 +650,28 @@ foreach(($catalog['plugins']??[]) as $plugin) {
 <dialog id="refresh-<?=h($variantEntryId)?>"><form method="post" class="stack"><div class="dialog-title"><h2>Refresh <?=h($variant['name'])?></h2><button type="button" class="icon" data-close>×</button></div><input type="hidden" name="csrf" value="<?=csrf()?>"><input type="hidden" name="form" value="catalog_refresh"><input type="hidden" name="entry_id" value="<?=h($variantEntryId)?>"><p>Fetch the latest GitHub release, recalculate its checksum and archive member, and re-detect plugin types, maturity, license, and description—even when the release version has not changed. If the release now has OS/architecture builds that weren't in the catalog before, they're added too, not just this entry.</p><label>Minisign key password<input type="password" name="signing_password" autocomplete="current-password" required></label><button>Refresh, sign, and publish</button></form></dialog>
 
 <dialog id="delete-<?=h($variantEntryId)?>"><form method="post" class="stack"><div class="dialog-title"><h2>Delete <?=h($variant['name'])?></h2><button type="button" class="icon" data-close>×</button></div><input type="hidden" name="csrf" value="<?=csrf()?>"><input type="hidden" name="form" value="catalog_delete"><input type="hidden" name="entry_id" value="<?=h($variantEntryId)?>"><p>This removes only this MariaDB version, architecture, and soname entry. Installed plugins on agents are not uninstalled automatically.</p><label>Type DELETE to confirm<input name="confirmation" pattern="DELETE" autocomplete="off" required></label><label>Minisign key password<input type="password" name="signing_password" autocomplete="current-password" required></label><button class="danger">Delete, sign, and publish</button></form></dialog>
+<?php if (($authorityStatus[$variantEntryId]??null)==='differs'): ?>
+<dialog id="authority-sync-<?=h($variantEntryId)?>"><form method="post" class="stack"><div class="dialog-title"><h2>Sync <?=h($variant['name'])?> from the authority</h2><button type="button" class="icon" data-close>×</button></div><input type="hidden" name="csrf" value="<?=csrf()?>"><input type="hidden" name="form" value="authority_sync_entry"><input type="hidden" name="entry_id" value="<?=h($variantEntryId)?>"><p>Replaces this entry's version, checksum, and other fields with the authority catalog's copy, then signs and publishes with this instance's own key.</p><label>Minisign key password<input type="password" name="signing_password" autocomplete="current-password" required></label><button>Sync, sign, and publish</button></form></dialog>
+<?php endif; ?>
 <?php endforeach; endif; ?>
 <?php endforeach; ?><div class="catalog-no-matches card" data-catalog-no-matches hidden>No catalog entries match the selected filters.</div></div></section>
 <?php if (!$catalog['plugins']??[]): ?><div class="empty card">No catalog entries yet.</div><?php endif; ?>
 
 <?php elseif ($isAdminPage): ?>
-<?php if (!$canManageEnrollment && !$canManageUsers && !$canManageDistribution): ?>
+<?php if (!$canManageEnrollment && !$canManageUsers && !$canManageDistribution && !$canManageCatalogSource): ?>
 <section><div class="empty card">You don't have access to this section.</div></section>
 <?php else:
 $enrollmentMode = $canManageEnrollment ? $app->enrollmentMode() : '';
 $enrollmentTokens = $canManageEnrollment ? $app->enrollmentTokens() : [];
 $users = $canManageUsers ? $app->users() : [];
-$distributionMode = $canManageDistribution ? $app->distributionMode() : '';
+$distributionMode = ($canManageDistribution && $catalogMode === 'local') ? $app->distributionMode() : '';
+$remoteCatalogUrl = $canManageCatalogSource ? $app->remoteCatalogUrl() : '';
+$remoteCatalogPublicKey = $canManageCatalogSource ? $app->remoteCatalogPublicKey() : '';
+$remoteCatalogSyncedAt = $canManageCatalogSource ? $app->remoteCatalogSyncedAt() : '';
+$authorityEnabled = ($canManageCatalogSource && $catalogMode === 'local') ? $app->authorityEnabled() : false;
+$authorityCatalogUrl = ($canManageCatalogSource && $catalogMode === 'local') ? $app->authorityCatalogUrl() : '';
+$authorityCatalogPublicKey = ($canManageCatalogSource && $catalogMode === 'local') ? $app->authorityCatalogPublicKey() : '';
+$authorityCheckedAt = ($canManageCatalogSource && $catalogMode === 'local') ? $app->authorityCheckedAt() : '';
 ?>
 <section id="admin"><div class="section-title"><div><span class="eyebrow">SECURITY</span><h2>Administration</h2></div></div>
 <div class="admin-grid">
@@ -582,8 +681,36 @@ $distributionMode = $canManageDistribution ? $app->distributionMode() : '';
 <?php if($enrollmentMode==='shared'): ?><div class="admin-notice">Dedicated tokens are inactive while shared enrollment mode is selected.</div><?php endif; ?>
 <div class="token-list"><?php foreach($enrollmentTokens as $enrollmentToken): ?><div class="token-row"><div><code><?=h($enrollmentToken['token'])?></code><small>Created <?=h(str_replace(['T','Z'],[' ',' UTC'],$enrollmentToken['created_at']))?></small></div><div class="token-actions"><button type="button" class="small secondary" data-copy-token="<?=h($enrollmentToken['token'])?>">Copy</button><form method="post"><input type="hidden" name="csrf" value="<?=csrf()?>"><input type="hidden" name="form" value="enrollment_revoke"><input type="hidden" name="token_id" value="<?=h($enrollmentToken['id'])?>"><button class="small danger">Revoke</button></form></div></div><?php endforeach; ?><?php if(!$enrollmentTokens): ?><div class="empty-token-list">No dedicated enrollment tokens are available.</div><?php endif; ?></div></article>
 <?php endif; ?>
-<?php if ($canManageDistribution): ?>
+<?php if ($canManageCatalogSource): ?>
+<article class="admin-panel card"><h3>Catalog source</h3><p>Curate the catalog here, or mirror another Banquise (or compatible) instance's already-signed catalog verbatim instead.</p>
+<form method="post" class="stack" enctype="multipart/form-data"><input type="hidden" name="csrf" value="<?=csrf()?>"><input type="hidden" name="form" value="catalog_source">
+<div class="mode-options">
+<label class="mode-option"><input type="radio" name="catalog_mode" value="local" <?=$catalogMode==='local'?'checked':''?>><span><strong>Local management</strong><small>Add, edit, refresh, and delete catalog entries on this server, signed with its own key.</small></span></label>
+<label class="mode-option"><input type="radio" name="catalog_mode" value="remote" <?=$catalogMode==='remote'?'checked':''?>><span><strong>External catalog</strong><small>Fetch and verify another catalog's catalog.json/.minisig as-is. Adding, editing, deleting, refreshing, and distribution mode are disabled here while this is on.</small></span></label>
+</div>
+<label>External catalog URL<input type="url" name="remote_catalog_url" placeholder="https://other-banquise.example.com/catalog.json" value="<?=h($remoteCatalogUrl)?>"></label>
+<label>Public key<input type="file" name="remote_catalog_public_key"><small><?=$remoteCatalogPublicKey!==''?'A key is already stored on this server; only upload a file to replace it.':'The other catalog\'s Minisign .pub file — required before external mode can be enabled.'?></small></label>
+<button>Save catalog source</button></form>
+<?php if ($catalogMode === 'remote'): ?>
+<div class="admin-notice">Mirroring <code><?=h($remoteCatalogUrl)?></code><?=$remoteCatalogSyncedAt!==''?'. Last synced '.h(str_replace(['T','Z'],[' ',' UTC'],$remoteCatalogSyncedAt)).'.':' — not yet synced.'?></div>
+<form method="post" data-spin-on-submit><input type="hidden" name="csrf" value="<?=csrf()?>"><input type="hidden" name="form" value="catalog_source_sync"><button type="submit" class="small secondary">Sync now</button></form>
+<?php endif; ?>
+</article>
+<?php endif; ?>
+<?php if ($canManageCatalogSource && $catalogMode === 'local'): ?>
+<article class="admin-panel card"><h3>Authority verification</h3><p>Optionally cross-check this catalog against another Banquise's — a difference or a plugin only the authority has is flagged, never applied automatically.</p>
+<form method="post" class="stack" enctype="multipart/form-data"><input type="hidden" name="csrf" value="<?=csrf()?>"><input type="hidden" name="form" value="authority_source">
+<label class="mode-option"><input type="checkbox" name="authority_enabled" value="1" <?=$authorityEnabled?'checked':''?>><span><strong>Enable authority verification</strong><small>Adds a Verify icon next to catalog refresh, and a sync-from-authority icon on any plugin that differs.</small></span></label>
+<label>Authority catalog URL<input type="url" name="authority_catalog_url" placeholder="https://authority-banquise.example.com/catalog.json" value="<?=h($authorityCatalogUrl)?>"></label>
+<label>Public key<input type="file" name="authority_catalog_public_key"><small><?=$authorityCatalogPublicKey!==''?'A key is already stored on this server; only upload a file to replace it.':'The authority\'s Minisign .pub file — required before verification can be enabled.'?></small></label>
+<button>Save authority source</button></form>
+<?php if ($authorityEnabled): ?><div class="admin-notice">Checking against <code><?=h($authorityCatalogUrl)?></code><?=$authorityCheckedAt!==''?'. Last verified '.h(str_replace(['T','Z'],[' ',' UTC'],$authorityCheckedAt)).'.':' — not yet verified.'?></div><?php endif; ?>
+</article>
+<?php endif; ?>
+<?php if ($canManageDistribution && $catalogMode === 'local'): ?>
 <article class="admin-panel card"><h3>Distribution mode</h3><p>How MariaDB servers fetch plugin files referenced by the catalog.</p><form method="post" class="stack"><input type="hidden" name="csrf" value="<?=csrf()?>"><input type="hidden" name="form" value="distribution_mode"><div class="mode-options"><label class="mode-option"><input type="radio" name="mode" value="public" <?=$distributionMode==='public'?'checked':''?>><span><strong>Public</strong><small>download_url points at each plugin's original GitHub release asset.</small></span></label><label class="mode-option"><input type="radio" name="mode" value="private" <?=$distributionMode==='private'?'checked':''?>><span><strong>Private</strong><small>Banquise downloads and mirrors every plugin file; servers fetch it from this Banquise instance instead of the internet.</small></span></label></div><label>Minisign key password<input type="password" name="signing_password" autocomplete="current-password"><small>Only needed if the catalog isn't empty — switching modes re-signs and republishes it so every entry matches immediately.</small></label><button>Save distribution mode</button></form></article>
+<?php elseif ($canManageDistribution): ?>
+<article class="admin-panel card"><h3>Distribution mode</h3><div class="admin-notice">Unavailable while an external catalog is mirrored — its download_url values are part of the signed file this server only relays, not writes.</div></article>
 <?php endif; ?>
 <?php if ($canManageUsers): ?>
 <article class="admin-panel card users-panel"><h3>Create a user</h3><p>New users receive an emailed setup link to choose their own password. A user can hold multiple roles.</p>
@@ -591,7 +718,7 @@ $distributionMode = $canManageDistribution ? $app->distributionMode() : '';
 <div class="form-grid"><label>Email<input type="email" name="email" required></label><label>Display name<input name="display_name" required></label></div>
 <div class="role-checkboxes"><?php foreach (BanquiseAuth::ROLES as $role): ?><label class="role-checkbox"><input type="checkbox" name="roles[]" value="<?=h($role)?>"><span><?=h(roleLabel($role))?></span></label><?php endforeach; ?></div>
 <button>Create user and email a setup link</button></form></article>
-<article class="admin-panel card users-panel"><h3>Users</h3><p><?=count($users)?> account(s).</p>
+<article class="admin-panel card users-panel users-list-panel"><h3>Users</h3><p><?=count($users)?> account(s).</p>
 <div class="user-list"><?php foreach ($users as $user): ?><div class="user-row">
 <div class="user-row-identity"><strong><?=h($user['display_name'] ?: $user['email'])?></strong><small><?=h($user['email'])?> &middot; <?=$user['has_password']?'active':'setup pending'?> &middot; <span class="badge <?=$user['status']==='active'?'active':'disabled'?>"><?=h($user['status'])?></span></small></div>
 <form method="post" class="stack user-roles-form"><input type="hidden" name="csrf" value="<?=csrf()?>"><input type="hidden" name="form" value="user_roles"><input type="hidden" name="user_id" value="<?=h($user['id'])?>"><div class="role-checkboxes"><?php foreach (BanquiseAuth::ROLES as $role): ?><label class="role-checkbox"><input type="checkbox" name="roles[]" value="<?=h($role)?>" <?=in_array($role,$user['roles'],true)?'checked':''?>><span><?=h(roleLabel($role))?></span></label><?php endforeach; ?></div><button class="small secondary">Save roles</button></form>
@@ -615,7 +742,7 @@ $submissions = $app->submissions($statusFilter !== '' ? $statusFilter : null);
 <section id="submissions"><div class="section-title"><div><span class="eyebrow">COMMUNITY</span><h2>Plugin submissions</h2></div></div>
 <nav class="status-filters"><a class="badge<?=$statusFilter===''?' active-filter':''?>" href="?page=submissions">All</a><?php foreach ($allowedStatuses as $statusOption): ?><a class="badge <?=h($statusOption)?><?=$statusFilter===$statusOption?' active-filter':''?>" href="?page=submissions&status=<?=urlencode($statusOption)?>"><?=h(submissionStatusLabel($statusOption))?></a><?php endforeach; ?></nav>
 <table><thead><tr><th>Name</th><th>Repository</th><th>Submitted by</th><th>Status</th><th>Comments</th><th>Submitted</th><th></th></tr></thead><tbody>
-<?php foreach ($submissions as $submission): ?><tr><td><strong><?=h($submission['name'] ?: '—')?></strong></td><td><a href="<?=h($submission['repository'])?>" target="_blank" rel="noopener noreferrer"><?=h($submission['repository'])?></a></td><td><?=h($submission['submitter_name'] ?: '—')?><?php if($submission['submitter_email']): ?><br><small><?=h($submission['submitter_email'])?></small><?php endif; ?></td><td><span class="badge <?=h($submission['status'])?>"><?=h(submissionStatusLabel($submission['status']))?></span></td><td><?=h($submission['comment_count'])?></td><td><?=h(str_replace(['T','Z'],[' ',' UTC'],$submission['created_at']))?></td><td><div class="submission-row-actions"><button type="button" class="small secondary" data-dialog="submission-<?=h($submission['id'])?>">Review</button><?php if ($canWriteCatalog && $submission['status'] === 'reviewed_ok'): ?><a href="?submission_id=<?=h($submission['id'])?>#catalog" class="as-button">Add to catalog</a><?php endif; ?></div></td></tr><?php endforeach; ?>
+<?php foreach ($submissions as $submission): ?><tr><td><strong><?=h($submission['name'] ?: '—')?></strong></td><td><a href="<?=h($submission['repository'])?>" target="_blank" rel="noopener noreferrer"><?=h($submission['repository'])?></a></td><td><?=h($submission['submitter_name'] ?: '—')?><?php if($submission['submitter_email']): ?><br><small><?=h($submission['submitter_email'])?></small><?php endif; ?></td><td><span class="badge <?=h($submission['status'])?>"><?=h(submissionStatusLabel($submission['status']))?></span></td><td><?=h($submission['comment_count'])?></td><td><?=h(str_replace(['T','Z'],[' ',' UTC'],$submission['created_at']))?></td><td><div class="submission-row-actions"><button type="button" class="small secondary" data-dialog="submission-<?=h($submission['id'])?>">Review</button><?php if ($canEditCatalogNow && $submission['status'] === 'reviewed_ok'): ?><a href="?submission_id=<?=h($submission['id'])?>#catalog" class="as-button">Add to catalog</a><?php endif; ?></div></td></tr><?php endforeach; ?>
 <?php if (!$submissions): ?><tr><td colspan="7" class="empty-row">No submissions<?=$statusFilter!==''?' with this status':''?>.</td></tr><?php endif; ?>
 </tbody></table></section>
 
@@ -632,7 +759,7 @@ $submissions = $app->submissions($statusFilter !== '' ? $statusFilter : null);
 
 <footer class="site-credit"><span class="credit-mark"><img src="/assets/by_lefred.png" alt="by lefred"></span></footer>
 </main>
-<?php if ($isDashboard && $canWriteCatalog): ?>
+<?php if ($isDashboard && $canEditCatalogNow): ?>
 <?php if ($legacyDuplicates): ?>
 <dialog id="prune-duplicates-dialog"><form method="post" class="stack"><div class="dialog-title"><h2>Remove legacy duplicate entries</h2><button type="button" class="icon" data-close>×</button></div>
 <input type="hidden" name="csrf" value="<?=csrf()?>"><input type="hidden" name="form" value="catalog_prune_duplicates">
@@ -640,6 +767,15 @@ $submissions = $app->submissions($statusFilter !== '' ? $statusFilter : null);
 <ul class="legacy-duplicate-list"><?php foreach ($legacyDuplicates as $legacyEntry): ?><li><strong><?=h($legacyEntry['name'])?></strong> <?=h($legacyEntry['version'])?> — MariaDB <?=h($legacyEntry['mariadb_version'])?>, <?=h($legacyEntry['architecture'])?></li><?php endforeach; ?></ul>
 <label>Minisign key password<input type="password" name="signing_password" autocomplete="current-password" required></label>
 <button class="danger">Remove and re-publish</button></form></dialog>
+<?php endif; ?>
+<?php if ($authorityMissing): ?>
+<dialog id="authority-missing-dialog"><div class="dialog-content"><div class="dialog-title"><div><span class="eyebrow">AUTHORITY</span><h2>Available from the authority catalog</h2></div><button type="button" class="icon" data-close>×</button></div>
+<p>Signed by the authority, not yet by this server. Adding one fetches the authority's copy of that entry, then signs and publishes it with this instance's own key.</p>
+<div class="authority-missing-list"><?php foreach ($authorityMissing as $missingItem): $missingEntry=$missingItem['entry']; ?><div class="authority-missing-row">
+<div><strong><?=h($missingEntry['name']??'?')?></strong> <?=h($missingEntry['version']??'')?><br><small>MariaDB <?=h($missingEntry['mariadb_version']??'')?>, <?=h($missingEntry['architecture']??'')?><?=!empty($missingEntry['os'])?', '.h($missingEntry['os']):''?></small></div>
+<form method="post" class="authority-missing-form"><input type="hidden" name="csrf" value="<?=csrf()?>"><input type="hidden" name="form" value="authority_sync_entry"><input type="hidden" name="entry_id" value="<?=h($missingItem['id'])?>"><input type="password" name="signing_password" placeholder="Minisign password" autocomplete="current-password" required><button class="small">Add</button></form>
+</div><?php endforeach; ?></div>
+</div></dialog>
 <?php endif; ?>
 <dialog id="repo-dialog"><form method="post" class="stack"><div class="dialog-title"><h2>Add GitHub repository</h2><button type="button" class="icon" data-close>×</button></div><input type="hidden" name="csrf" value="<?=csrf()?>"><input type="hidden" name="form" value="repository_preview">
 <?php if ($prefillSubmission): ?><input type="hidden" name="submission_id" value="<?=h($prefillSubmission['id'])?>"><?php endif; ?>
