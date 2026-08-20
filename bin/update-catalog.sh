@@ -6,24 +6,46 @@ usage() {
   cat <<'EOF'
 Usage: update-catalog.sh [options] GITHUB_REPOSITORY
 
-Create or update catalog entries from the latest GitHub release. Every Linux
-tar.gz asset named like this is processed:
+Create or update catalog entries from the latest GitHub release. Two asset
+naming conventions are recognized; a release is scanned for the first, and
+only if none match, for the second:
 
-  NAME-vVERSION-mariadbMAJOR.MINOR-linux-ARCH.tar.gz
+  NAME-vVERSION-mariadbMAJOR.MINOR-OS-ARCH.tar.gz   (a tar.gz archive)
+  NAME-VERSION-mariadbMAJOR.MINOR-OS.so             (a standalone .so file)
+
+OS is a free-form target tag such as "linux", "el8", or "ubuntu24.04"; each
+distinct OS (and, for the archive form, ARCH) for the same MariaDB version
+becomes its own catalog entry. The standalone-.so form has no architecture in
+its name, so --architecture must be passed (or it defaults to x86_64); the
+soname installed on the server defaults to NAME.so, downloaded as-is with no
+archive to unpack.
 
 Options:
   -c, --catalog FILE       Catalog to create/update (default: catalog.json)
       --name NAME          Catalog plugin name (default: asset name with - -> _)
-      --soname FILE        Select this .so when an archive contains several
+      --soname FILE        Select this .so when an archive contains several,
+                           or override the installed filename for a
+                           standalone .so (default: NAME.so)
+      --architecture ARCH  Architecture for standalone .so assets, which
+                           don't encode it in the filename (default: x86_64)
       --plugin-types TEXT  Override inferred types, e.g. "FUNCTION"
       --license TEXT       Override GitHub's SPDX license
       --maturity TEXT      Override inferred maturity (prerelease/0.x -> beta)
       --description TEXT   Override the GitHub repository description
+      --author TEXT        Override the detected author (default: repository owner)
       --dependencies TEXT  Catalog dependency message
       --message TEXT       Message displayed after installation
       --sign-key FILE      Sign the finished catalog with this Minisign key
       --sign-password-stdin
                            Read the Minisign key password from standard input
+      --dry-run            Detect and print the resulting entries as a JSON
+                           array on stdout; never reads or writes --catalog
+                           and never signs
+      --latest-version-only
+                           Print just the latest release version on stdout
+                           and exit; skips assets, source inspection, and
+                           the repository API call entirely (fast, for
+                           checking many repositories for updates)
   -h, --help               Show this help
 
 GITHUB_REPOSITORY may be https://github.com/OWNER/REPO or OWNER/REPO.
@@ -38,28 +60,36 @@ need() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 catalog=catalog.json
 name_override=
 soname_override=
+architecture_override=
 types_override=
 license_override=
 maturity_override=
 description_override=
+author_override=
 dependencies=
 install_message=
 sign_key=
 sign_password_stdin=0
+dry_run=0
+latest_version_only=0
 
 while (($#)); do
   case "$1" in
     -c|--catalog) (($# >= 2)) || die "$1 requires a value"; catalog=$2; shift 2 ;;
     --name) (($# >= 2)) || die "$1 requires a value"; name_override=$2; shift 2 ;;
     --soname) (($# >= 2)) || die "$1 requires a value"; soname_override=$2; shift 2 ;;
+    --architecture) (($# >= 2)) || die "$1 requires a value"; architecture_override=$2; shift 2 ;;
     --plugin-types) (($# >= 2)) || die "$1 requires a value"; types_override=$2; shift 2 ;;
     --license) (($# >= 2)) || die "$1 requires a value"; license_override=$2; shift 2 ;;
     --maturity) (($# >= 2)) || die "$1 requires a value"; maturity_override=$2; shift 2 ;;
     --description) (($# >= 2)) || die "$1 requires a value"; description_override=$2; shift 2 ;;
+    --author) (($# >= 2)) || die "$1 requires a value"; author_override=$2; shift 2 ;;
     --dependencies) (($# >= 2)) || die "$1 requires a value"; dependencies=$2; shift 2 ;;
     --message) (($# >= 2)) || die "$1 requires a value"; install_message=$2; shift 2 ;;
     --sign-key) (($# >= 2)) || die "$1 requires a value"; sign_key=$2; shift 2 ;;
     --sign-password-stdin) sign_password_stdin=1; shift ;;
+    --dry-run) dry_run=1; shift ;;
+    --latest-version-only) latest_version_only=1; shift ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
     -*) die "unknown option: $1" ;;
@@ -77,6 +107,8 @@ case "$repository_input" in
 esac
 [[ "$github_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] ||
   die "expected https://github.com/OWNER/REPO or OWNER/REPO"
+[[ -z "$architecture_override" || "$architecture_override" =~ ^[A-Za-z0-9_]+$ ]] ||
+  die "unsafe architecture: $architecture_override"
 
 for command in curl jq tar sha256sum mktemp mv; do need "$command"; done
 [[ -z "$sign_key" ]] || { need minisign; [[ -r "$sign_key" ]] || die "cannot read signing key: $sign_key"; }
@@ -89,7 +121,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-curl_args=(-fsSL --retry 3 --retry-all-errors
+curl_args=(-fsSL --connect-timeout 8 --max-time 20 --retry 3
   -H 'Accept: application/vnd.github+json'
   -H 'X-GitHub-Api-Version: 2022-11-28')
 if [[ -n "${GITHUB_TOKEN:-}" ]]; then
@@ -97,7 +129,6 @@ if [[ -n "${GITHUB_TOKEN:-}" ]]; then
 fi
 
 api_base="https://api.github.com/repos/$github_repo"
-curl "${curl_args[@]}" "$api_base" -o "$work_dir/repository.json"
 curl "${curl_args[@]}" "$api_base/releases/latest" -o "$work_dir/release.json"
 
 jq -e '.draft == false and (.assets | type == "array")' "$work_dir/release.json" >/dev/null ||
@@ -107,6 +138,13 @@ tag=$(jq -r '.tag_name' "$work_dir/release.json")
 version=${tag#v}
 [[ "$version" =~ ^[0-9]+([.][0-9A-Za-z]+)*([-+][0-9A-Za-z.-]+)?$ ]] ||
   die "cannot derive a safe plugin version from release tag: $tag"
+
+if ((latest_version_only)); then
+  printf '%s\n' "$version"
+  exit 0
+fi
+
+curl "${curl_args[@]}" "$api_base" -o "$work_dir/repository.json"
 
 description=$description_override
 [[ -n "$description" ]] || description=$(jq -r '.description // ""' "$work_dir/repository.json")
@@ -168,7 +206,23 @@ if [[ -z "$license_override" && "$license" == unknown ]] &&
   license=GPL
 fi
 
-if [[ -e "$catalog" ]]; then
+author=$author_override
+[[ -n "$author" ]] || author=$(jq -r '.owner.login // ""' "$work_dir/repository.json")
+last_release_at=$(jq -r '.published_at // ""' "$work_dir/release.json")
+
+# Best-effort: the latest commit on the default branch. Never fails the import.
+last_commit_at=
+default_branch=$(jq -r '.default_branch // "main"' "$work_dir/repository.json")
+if curl "${curl_args[@]}" "$api_base/commits/$(printf '%s' "$default_branch" | jq -sRr '@uri')" \
+     -o "$work_dir/commit.json" 2>/dev/null; then
+  last_commit_at=$(jq -r '.commit.committer.date // .commit.author.date // ""' "$work_dir/commit.json" 2>/dev/null || true)
+fi
+
+if ((dry_run)); then
+  # A preview never reads the real catalog: the output below is exactly the
+  # set of entries this run would add or update, not the whole catalog.
+  printf '{"schema_version":1,"plugins":[]}\n' >"$work_dir/catalog.json"
+elif [[ -e "$catalog" ]]; then
   jq -e '.schema_version == 1 and (.plugins | type == "array")' "$catalog" >/dev/null ||
     die "$catalog is not a schema-version 1 catalog"
   cp -- "$catalog" "$work_dir/catalog.json"
@@ -177,39 +231,69 @@ else
 fi
 
 mapfile -t assets < <(jq -r '.assets[] |
-  select(.name | test("-mariadb[0-9]+\\.[0-9]+-linux-[A-Za-z0-9_]+\\.tar\\.gz$")) |
+  select(.name | test("-mariadb[0-9]+\\.[0-9]+-[A-Za-z0-9_.]+-[A-Za-z0-9_]+\\.tar\\.gz$")) |
   [.name, .browser_download_url] | @tsv' "$work_dir/release.json")
-((${#assets[@]})) || die "latest release $tag has no matching Linux tar.gz assets"
+asset_format=tar.gz
+if ((${#assets[@]} == 0)); then
+  mapfile -t assets < <(jq -r '.assets[] |
+    select(.name | test("-mariadb[0-9]+\\.[0-9]+-[A-Za-z0-9_.]+\\.so$")) |
+    [.name, .browser_download_url] | @tsv' "$work_dir/release.json")
+  asset_format=so
+fi
+((${#assets[@]})) || die "latest release $tag has no matching tar.gz or standalone .so assets"
 
 for asset_record in "${assets[@]}"; do
   IFS=$'\t' read -r asset_name download_url <<<"$asset_record"
-  if [[ ! "$asset_name" =~ ^(.+)-v?${version//./\\.}-mariadb([0-9]+\.[0-9]+)-linux-([A-Za-z0-9_]+)\.tar\.gz$ ]]; then
-    die "asset does not match release version and naming contract: $asset_name"
+
+  if [[ "$asset_format" == tar.gz ]]; then
+    if [[ ! "$asset_name" =~ ^(.+)-v?${version//./\\.}-mariadb([0-9]+\.[0-9]+)-([A-Za-z0-9_.]+)-([A-Za-z0-9_]+)\.tar\.gz$ ]]; then
+      die "asset does not match release version and naming contract: $asset_name"
+    fi
+    asset_stem=${BASH_REMATCH[1]}
+    mariadb_version=${BASH_REMATCH[2]}
+    os=${BASH_REMATCH[3]}
+    architecture=${BASH_REMATCH[4]}
+  else
+    if [[ ! "$asset_name" =~ ^(.+)-v?${version//./\\.}-mariadb([0-9]+\.[0-9]+)-([A-Za-z0-9_.]+)\.so$ ]]; then
+      die "asset does not match release version and naming contract: $asset_name"
+    fi
+    asset_stem=${BASH_REMATCH[1]}
+    mariadb_version=${BASH_REMATCH[2]}
+    os=${BASH_REMATCH[3]}
+    architecture=${architecture_override:-x86_64}
   fi
-  asset_stem=${BASH_REMATCH[1]}
-  mariadb_version=${BASH_REMATCH[2]}
-  architecture=${BASH_REMATCH[3]}
   plugin_name=${name_override:-${asset_stem//-/_}}
   [[ "$plugin_name" =~ ^[A-Za-z0-9_-]+$ ]] || die "unsafe plugin name: $plugin_name"
 
-  archive="$work_dir/$asset_name"
-  curl "${curl_args[@]}" "$download_url" -o "$archive"
-  sha256=$(sha256sum "$archive" | awk '{print $1}')
+  downloaded="$work_dir/$asset_name"
+  curl "${curl_args[@]}" "$download_url" -o "$downloaded"
+  sha256=$(sha256sum "$downloaded" | awk '{print $1}')
 
-  mapfile -t members < <(tar -tzf "$archive" | grep -E '/lib/mariadb/plugin/[^/]+\.so$' || true)
-  ((${#members[@]})) || die "$asset_name contains no lib/mariadb/plugin/*.so"
-  archive_member=
-  if [[ -n "$soname_override" ]]; then
-    for member in "${members[@]}"; do
-      [[ "${member##*/}" == "$soname_override" ]] && archive_member=$member
-    done
-    [[ -n "$archive_member" ]] || die "$asset_name does not contain $soname_override"
-  elif ((${#members[@]} == 1)); then
-    archive_member=${members[0]}
+  if [[ "$asset_format" == tar.gz ]]; then
+    mapfile -t members < <(tar -tzf "$downloaded" | grep -E '/lib/mariadb/plugin/[^/]+\.so$' || true)
+    ((${#members[@]})) || die "$asset_name contains no lib/mariadb/plugin/*.so"
+    archive_member=
+    if [[ -n "$soname_override" ]]; then
+      for member in "${members[@]}"; do
+        [[ "${member##*/}" == "$soname_override" ]] && archive_member=$member
+      done
+      [[ -n "$archive_member" ]] || die "$asset_name does not contain $soname_override"
+    elif ((${#members[@]} == 1)); then
+      archive_member=${members[0]}
+    else
+      die "$asset_name contains multiple plugins; select one with --soname"
+    fi
+    soname=${archive_member##*/}
+    archive_type_value=tar.gz
   else
-    die "$asset_name contains multiple plugins; select one with --soname"
+    # A standalone .so release asset: no archive to unpack, the download is the
+    # plugin file itself, installed under a clean name rather than the asset's
+    # version/MariaDB/OS-decorated filename.
+    archive_member=
+    soname=${soname_override:-${plugin_name}.so}
+    [[ "$soname" =~ ^[A-Za-z0-9_.+-]+\.so$ ]] || die "unsafe soname: $soname"
+    archive_type_value=
   fi
-  soname=${archive_member##*/}
 
   entry=$(jq -n \
     --arg name "$plugin_name" \
@@ -217,37 +301,59 @@ for asset_record in "${assets[@]}"; do
     --arg version "$version" \
     --arg mariadb_version "$mariadb_version" \
     --arg architecture "$architecture" \
+    --arg os "$os" \
     --arg soname "$soname" \
     --arg download_url "$download_url" \
     --arg sha256 "$sha256" \
+    --arg archive_type "$archive_type_value" \
     --arg archive_member "$archive_member" \
     --arg plugin_types "$plugin_types" \
     --arg license "$license" \
     --arg maturity "$maturity" \
     --arg description "$description" \
+    --arg author "$author" \
+    --arg last_release_at "$last_release_at" \
+    --arg last_commit_at "$last_commit_at" \
     --arg dependencies "$dependencies" \
     --arg message "$install_message" \
     '{name:$name, repository:$repository, version:$version,
       mariadb_version:$mariadb_version, architecture:$architecture,
       soname:$soname, download_url:$download_url, sha256:$sha256,
-      archive_type:"tar.gz", archive_member:$archive_member,
       plugin_types:$plugin_types, license:$license, maturity:$maturity,
       description:$description}
+     + (if $archive_type == "" then {} else {archive_type:$archive_type} end)
+     + (if $archive_member == "" then {} else {archive_member:$archive_member} end)
+     + (if $os == "" then {} else {os:$os} end)
+     + (if $author == "" then {} else {author:$author} end)
+     + (if $last_release_at == "" then {} else {last_release_at:$last_release_at} end)
+     + (if $last_commit_at == "" then {} else {last_commit_at:$last_commit_at} end)
      + (if $dependencies == "" then {} else {dependencies:$dependencies} end)
      + (if $message == "" then {} else {message:$message} end)')
 
+  # An existing entry is replaced by this one when its name/MariaDB
+  # version/architecture/soname match and either its OS matches too, or it
+  # predates OS tracking (no OS recorded at all) and is being claimed by
+  # whichever OS-tagged asset is processed first. Any other existing OS
+  # variant for the same plugin is left untouched.
   jq --argjson entry "$entry" '
     .plugins = ([.plugins[] |
       select(.name != $entry.name or
              .mariadb_version != $entry.mariadb_version or
              .architecture != $entry.architecture or
-             .soname != $entry.soname)] + [$entry])
+             .soname != $entry.soname or
+             ((.os // "") != "" and (.os // "") != ($entry.os // "")))] + [$entry])
     | .plugins |= sort_by([(.name | ascii_downcase), .name,
-                           .mariadb_version, .architecture, .soname])' \
+                           .mariadb_version, .architecture, (.os // ""), .soname])' \
     "$work_dir/catalog.json" >"$work_dir/catalog.next.json"
   mv -- "$work_dir/catalog.next.json" "$work_dir/catalog.json"
-  note "added/updated $plugin_name $version for MariaDB $mariadb_version $architecture"
+  note "detected $plugin_name $version for MariaDB $mariadb_version $os/$architecture"
 done
+
+if ((dry_run)); then
+  jq -c '.plugins' "$work_dir/catalog.json"
+  note "dry run: ${#assets[@]} release asset(s) processed, catalog untouched"
+  exit 0
+fi
 
 catalog_dir=$(dirname -- "$catalog")
 catalog_base=$(basename -- "$catalog")

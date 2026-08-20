@@ -1,6 +1,18 @@
 document.querySelectorAll('[data-dialog]').forEach(button => button.addEventListener('click', () => document.getElementById(button.dataset.dialog).showModal()));
 document.querySelectorAll('[data-close]').forEach(button => button.addEventListener('click', () => button.closest('dialog').close()));
 
+// Spins the submit button's icon and disables it while a plain (non-fetch) form
+// submission is in flight, so a request that takes a few seconds still gives
+// feedback. The full-page navigation that follows naturally stops it.
+document.querySelectorAll('[data-spin-on-submit]').forEach(form => {
+  form.addEventListener('submit', () => {
+    const button = form.querySelector('button[type="submit"]');
+    if (!button) return;
+    button.disabled = true;
+    button.classList.add('spinning');
+  });
+});
+
 document.querySelectorAll('[data-copy-catalog-url]').forEach(button => {
   button.addEventListener('click', async () => {
     try {

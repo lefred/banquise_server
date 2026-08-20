@@ -647,6 +647,90 @@ button.catalog-copy-button {
   display: block;
 }
 
+.catalog-key-button {
+  display: inline-grid;
+  place-items: center;
+  width: 31px;
+  height: 31px;
+  color: var(--teal);
+  background: #eaf1f8;
+  border-radius: 8px;
+}
+
+.catalog-key-button:hover {
+  color: white;
+  background: var(--teal);
+}
+
+.catalog-key-button svg {
+  width: 16px;
+  height: 16px;
+  fill: currentColor;
+}
+
+.catalog-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.catalog-header-actions form {
+  margin: 0;
+}
+
+button.catalog-refresh-button {
+  display: inline-grid;
+  place-items: center;
+  width: 39px;
+  height: 39px;
+  padding: 0;
+  color: var(--teal);
+  background: #eaf1f8;
+}
+
+.catalog-refresh-button:hover {
+  color: white;
+  background: var(--teal);
+}
+
+.catalog-refresh-button svg {
+  width: 17px;
+  height: 17px;
+  fill: currentColor;
+}
+
+.catalog-refresh-button:disabled {
+  opacity: .7;
+  cursor: default;
+}
+
+.catalog-refresh-button.spinning svg {
+  animation: catalog-refresh-spin .8s linear infinite;
+}
+
+@keyframes catalog-refresh-spin {
+  to { transform: rotate(360deg); }
+}
+
+.plugin {
+  position: relative;
+}
+
+.plugin-update-badge {
+  position: absolute;
+  top: -10px;
+  right: 18px;
+  padding: 4px 11px;
+  border-radius: 99px;
+  background: #fff3d6;
+  color: #98670a;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  box-shadow: 0 4px 10px rgba(25, 61, 66, .12);
+}
+
 .catalog-filter-top {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(300px, 440px);
@@ -991,4 +1075,318 @@ button.installation-count:disabled {
   .bulk-action-bar label {
     width: 100%;
   }
+}
+
+/* Roles, users, public catalog, and plugin submissions. */
+
+.login-footnote {
+  margin-top: 18px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.metrics-1 {
+  grid-template-columns: 130px;
+}
+
+.metrics-2 {
+  grid-template-columns: repeat(2, 110px);
+}
+
+.honeypot {
+  position: absolute;
+  left: -9999px;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+}
+
+.form-note {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.status-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 22px;
+}
+
+.status-filters a {
+  cursor: pointer;
+}
+
+.badge.active-filter {
+  outline: 2px solid var(--teal);
+  outline-offset: 1px;
+}
+
+.badge.new {
+  background: #e6f3f2;
+  color: var(--teal);
+}
+
+.badge.in_review {
+  background: #fff3d6;
+  color: #98670a;
+}
+
+.badge.reviewed_ok {
+  background: #e1f7ed;
+  color: #08754b;
+}
+
+.badge.denied,
+.badge.spam {
+  background: #fde7e7;
+  color: #a33030;
+}
+
+.submission-dialog {
+  width: min(760px, 94vw);
+}
+
+.submission-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  margin: 0;
+}
+
+.submission-fields div {
+  padding: 5px 0;
+}
+
+.submission-fields dt {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.submission-fields dd {
+  margin: 2px 0;
+  font-weight: 600;
+}
+
+.submission-row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.as-button {
+  display: inline-block;
+  border-radius: 10px;
+  padding: 7px 11px;
+  background: var(--teal);
+  color: white;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.55;
+  cursor: pointer;
+}
+
+.as-button:hover {
+  background: #001f49;
+}
+
+.comment-thread {
+  display: grid;
+  gap: 10px;
+  margin: 14px 0 20px;
+}
+
+.comment {
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: #f9fbfb;
+}
+
+.comment-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.comment p {
+  margin: 6px 0 0;
+}
+
+.role-checkboxes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.role-checkbox {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 99px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.role-checkbox:has(input:checked) {
+  background: #f0f5fa;
+  border-color: #9db6cc;
+  color: var(--teal);
+}
+
+.role-checkbox input {
+  width: auto;
+  accent-color: var(--teal);
+}
+
+.user-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.user-row {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+
+.user-row-identity small {
+  display: block;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.user-roles-form {
+  gap: 8px;
+}
+
+.user-row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.user-row-actions form {
+  margin: 0;
+}
+
+@media (max-width: 620px) {
+  .submission-fields {
+    grid-template-columns: 1fr;
+  }
+}
+
+.review-import-dialog {
+  width: min(820px, 94vw);
+}
+
+.review-entry {
+  display: grid;
+  gap: 13px;
+  margin: 0 0 16px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+
+.review-entry legend {
+  padding: 0 6px;
+}
+
+.review-entry legend label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--teal);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.review-entry legend input {
+  width: auto;
+  accent-color: var(--teal);
+}
+
+.discard-form {
+  margin-top: 4px;
+}
+
+.legacy-duplicates-alert {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.legacy-duplicate-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding-left: 20px;
+  font-size: 13px;
+}
+
+.nav-link-with-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.nav-badge {
+  display: inline-grid;
+  place-items: center;
+  min-width: 19px;
+  height: 19px;
+  padding: 0 5px;
+  border-radius: 99px;
+  background: var(--teal);
+  color: white;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.plugin-variants {
+  grid-column: 1 / -1;
+  margin-top: 6px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.plugin-variants summary {
+  cursor: pointer;
+  color: var(--teal);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+
+.plugin-variants[open] summary {
+  margin-bottom: 12px;
+}
+
+.variant-table-wrap {
+  overflow-x: auto;
+}
+
+.variant-table {
+  min-width: 640px;
+}
+
+.variant-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
 }

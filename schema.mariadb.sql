@@ -68,6 +68,78 @@ CREATE TABLE IF NOT EXISTS enrollment_tokens (
   created_at VARCHAR(20) NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
+-- Staff accounts. password_hash stays NULL until the emailed setup link is used.
+CREATE TABLE IF NOT EXISTS users (
+  id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  email VARCHAR(255) NOT NULL,
+  display_name VARCHAR(100) NOT NULL DEFAULT '',
+  password_hash VARCHAR(255) NULL,
+  status ENUM('active','disabled') NOT NULL DEFAULT 'active',
+  created_at VARCHAR(20) NOT NULL,
+  UNIQUE KEY users_email(email)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+-- A user can hold several roles; each row grants one.
+CREATE TABLE IF NOT EXISTS user_roles (
+  user_id INT UNSIGNED NOT NULL,
+  role ENUM('administrator','fleet_manager','fleet_viewer','plugin_manager') NOT NULL,
+  PRIMARY KEY(user_id, role),
+  CONSTRAINT user_roles_user_fk FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+-- Single-use, time-limited links that let a newly created user set their password.
+CREATE TABLE IF NOT EXISTS password_setup_tokens (
+  id CHAR(16) NOT NULL PRIMARY KEY,
+  user_id INT UNSIGNED NOT NULL,
+  token_hash CHAR(64) NOT NULL UNIQUE,
+  created_at VARCHAR(20) NOT NULL,
+  expires_at VARCHAR(20) NOT NULL,
+  consumed_at VARCHAR(20) NULL,
+  CONSTRAINT password_setup_tokens_user_fk FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+-- Plugins proposed by the public for catalog inclusion.
+CREATE TABLE IF NOT EXISTS plugin_submissions (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(128) NOT NULL DEFAULT '',
+  repository VARCHAR(255) NOT NULL,
+  description TEXT NOT NULL,
+  plugin_types VARCHAR(255) NOT NULL DEFAULT '',
+  license VARCHAR(64) NOT NULL DEFAULT '',
+  maturity VARCHAR(32) NOT NULL DEFAULT '',
+  dependencies VARCHAR(255) NOT NULL DEFAULT '',
+  message TEXT NOT NULL,
+  submitter_name VARCHAR(128) NOT NULL DEFAULT '',
+  submitter_email VARCHAR(255) NOT NULL DEFAULT '',
+  status ENUM('new','in_review','reviewed_ok','denied','spam') NOT NULL DEFAULT 'new',
+  remote_address VARCHAR(255) NOT NULL DEFAULT '',
+  created_at VARCHAR(20) NOT NULL,
+  updated_at VARCHAR(20) NOT NULL,
+  KEY submissions_status(status, id),
+  KEY submissions_remote_address(remote_address, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+-- Internal review notes, visible only to administrators and plugin managers.
+CREATE TABLE IF NOT EXISTS submission_comments (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  submission_id BIGINT UNSIGNED NOT NULL,
+  user_id INT UNSIGNED NULL,
+  body TEXT NOT NULL,
+  created_at VARCHAR(20) NOT NULL,
+  CONSTRAINT submission_comments_submission_fk FOREIGN KEY(submission_id) REFERENCES plugin_submissions(id) ON DELETE CASCADE,
+  CONSTRAINT submission_comments_user_fk FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+-- Result of the last "check for updates" pass: a catalog entry appears here
+-- only while a newer GitHub release than its stored version is known: it is
+-- removed once the entry is refreshed/edited past that version, or once a
+-- later check finds it's no longer behind.
+CREATE TABLE IF NOT EXISTS catalog_update_checks (
+  entry_id CHAR(64) NOT NULL PRIMARY KEY,
+  available_version VARCHAR(64) NOT NULL,
+  checked_at VARCHAR(20) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
 -- Restore the caller's original session settings.
 SET SQL_MODE=@OLD_SQL_MODE, FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS;
 SET UNIQUE_CHECKS=@OLD_UNIQUE_CHECKS, NOTE_VERBOSITY=@OLD_NOTE_VERBOSITY;

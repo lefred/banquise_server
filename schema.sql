@@ -53,3 +53,71 @@ CREATE TABLE IF NOT EXISTS enrollment_tokens (
   encrypted_token TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+
+-- Staff accounts. password_hash stays NULL until the emailed setup link is used.
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT NOT NULL UNIQUE,
+  display_name TEXT NOT NULL DEFAULT '',
+  password_hash TEXT,
+  status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','disabled')),
+  created_at TEXT NOT NULL
+);
+
+-- A user can hold several roles; each row grants one.
+CREATE TABLE IF NOT EXISTS user_roles (
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  role TEXT NOT NULL CHECK(role IN ('administrator','fleet_manager','fleet_viewer','plugin_manager')),
+  PRIMARY KEY(user_id, role)
+);
+
+-- Single-use, time-limited links that let a newly created user set their password.
+CREATE TABLE IF NOT EXISTS password_setup_tokens (
+  id TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token_hash TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  consumed_at TEXT
+);
+
+-- Plugins proposed by the public for catalog inclusion.
+CREATE TABLE IF NOT EXISTS plugin_submissions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL DEFAULT '',
+  repository TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  plugin_types TEXT NOT NULL DEFAULT '',
+  license TEXT NOT NULL DEFAULT '',
+  maturity TEXT NOT NULL DEFAULT '',
+  dependencies TEXT NOT NULL DEFAULT '',
+  message TEXT NOT NULL DEFAULT '',
+  submitter_name TEXT NOT NULL DEFAULT '',
+  submitter_email TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'new' CHECK(status IN ('new','in_review','reviewed_ok','denied','spam')),
+  remote_address TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS submissions_status ON plugin_submissions(status, id);
+CREATE INDEX IF NOT EXISTS submissions_remote_address ON plugin_submissions(remote_address, created_at);
+
+-- Internal review notes, visible only to administrators and plugin managers.
+CREATE TABLE IF NOT EXISTS submission_comments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  submission_id INTEGER NOT NULL REFERENCES plugin_submissions(id) ON DELETE CASCADE,
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  body TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+-- Result of the last "check for updates" pass: a catalog entry appears here
+-- only while a newer GitHub release than its stored version is known: it is
+-- removed once the entry is refreshed/edited past that version, or once a
+-- later check finds it's no longer behind.
+CREATE TABLE IF NOT EXISTS catalog_update_checks (
+  entry_id TEXT PRIMARY KEY,
+  available_version TEXT NOT NULL,
+  checked_at TEXT NOT NULL
+);
