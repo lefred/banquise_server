@@ -1,6 +1,6 @@
 # Banquise Server
 
-![banquise_server](public/assets/banquise_server_logo.png)
+![banquise_server](public/assets/banquise_server.png)
 
 Banquise Server is a small PHP 8.2+ control plane for managing signed MariaDB plugin catalogs and a fleet of `banquise_agent` instances. It uses SQLite (default/development) or MariaDB Server (preferred/production), a server-rendered administration interface, and a JSON HTTPS API with no PHP
 framework or JavaScript build chain.
