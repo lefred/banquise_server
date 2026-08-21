@@ -3,13 +3,16 @@ document.querySelectorAll('[data-close]').forEach(button => button.addEventListe
 
 // Spins the submit button's icon and disables it while a plain (non-fetch) form
 // submission is in flight, so a request that takes a few seconds still gives
-// feedback. The full-page navigation that follows naturally stops it.
+// feedback. The full-page navigation that follows naturally stops it. Buttons
+// without their own icon get a generic spinner (added by the .spinning CSS);
+// a data-loading-label also swaps in "Working…"-style text.
 document.querySelectorAll('[data-spin-on-submit]').forEach(form => {
   form.addEventListener('submit', () => {
-    const button = form.querySelector('button[type="submit"]');
+    const button = form.querySelector('button:not([type="button"])');
     if (!button) return;
     button.disabled = true;
     button.classList.add('spinning');
+    if (button.dataset.loadingLabel) button.textContent = button.dataset.loadingLabel;
   });
 });
 

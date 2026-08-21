@@ -43,9 +43,14 @@ final class BanquiseApi
         if (!is_array($plugins)) return;
         $delete = $this->app->db->prepare('DELETE FROM agent_plugins WHERE server_uid=?');
         $delete->execute([$uid]);
-        $insert = $this->app->db->prepare(
-            'INSERT INTO agent_plugins(server_uid,name,installed,loaded,managed,installed_version,observed_at) VALUES(?,?,?,?,?,?,?)'
-        );
+        // Upsert rather than plain INSERT: a single report can legitimately list the same
+        // plugin name more than once (e.g. a plugin registering several INFORMATION_SCHEMA
+        // rows under one name), and the primary key is (server_uid, name).
+        $sql = 'INSERT INTO agent_plugins(server_uid,name,installed,loaded,managed,installed_version,observed_at) VALUES(?,?,?,?,?,?,?) '
+            . ($this->app->databaseDriver === 'mariadb'
+                ? 'ON DUPLICATE KEY UPDATE installed=VALUES(installed), loaded=VALUES(loaded), managed=VALUES(managed), installed_version=VALUES(installed_version), observed_at=VALUES(observed_at)'
+                : 'ON CONFLICT(server_uid,name) DO UPDATE SET installed=excluded.installed, loaded=excluded.loaded, managed=excluded.managed, installed_version=excluded.installed_version, observed_at=excluded.observed_at');
+        $insert = $this->app->db->prepare($sql);
         foreach ($plugins as $plugin) {
             if (!is_array($plugin) || !preg_match('/^[A-Za-z0-9_-]{1,128}$/', (string)($plugin['name'] ?? ''))) continue;
             $insert->execute([$uid, $plugin['name'], !empty($plugin['installed']) ? 1 : 0,

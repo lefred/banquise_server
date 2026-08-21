@@ -508,6 +508,22 @@ button:disabled {
   opacity: .5;
 }
 
+/* Generic in-progress spinner for plain text buttons (icon buttons like
+   .catalog-refresh-button spin their own svg instead, see below). */
+button.spinning:not(.catalog-refresh-button)::after {
+  content: '';
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  margin-left: 8px;
+  vertical-align: -2px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  opacity: .7;
+  animation: catalog-refresh-spin .8s linear infinite;
+}
+
 .server-detail-actions {
   display: flex;
   align-items: center;
