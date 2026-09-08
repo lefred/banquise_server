@@ -41,19 +41,19 @@ final class BanquiseApi
     private function replaceAgentPlugins(string $uid, mixed $plugins, string $observedAt): void
     {
         if (!is_array($plugins)) return;
-        $delete = $this->app->db->prepare('DELETE FROM agent_plugins WHERE server_uid=?');
+        $delete = $this->app->db->prepare('DELETE FROM fleet_inventory WHERE server_uid=?');
         $delete->execute([$uid]);
-        // Upsert rather than plain INSERT: a single report can legitimately list the same
-        // plugin name more than once (e.g. a plugin registering several INFORMATION_SCHEMA
-        // rows under one name), and the primary key is (server_uid, name).
-        $sql = 'INSERT INTO agent_plugins(server_uid,name,installed,loaded,managed,installed_version,observed_at) VALUES(?,?,?,?,?,?,?) '
+        // Preserve identical plugin names from different repositories and merge build rows.
+        $sql = 'INSERT INTO fleet_inventory(server_uid,catalog_name,name,installed,loaded,managed,installed_version,observed_at) VALUES(?,?,?,?,?,?,?,?) '
             . ($this->app->databaseDriver === 'mariadb'
                 ? 'ON DUPLICATE KEY UPDATE installed=VALUES(installed), loaded=VALUES(loaded), managed=VALUES(managed), installed_version=VALUES(installed_version), observed_at=VALUES(observed_at)'
-                : 'ON CONFLICT(server_uid,name) DO UPDATE SET installed=excluded.installed, loaded=excluded.loaded, managed=excluded.managed, installed_version=excluded.installed_version, observed_at=excluded.observed_at');
+                : 'ON CONFLICT(server_uid,catalog_name,name) DO UPDATE SET installed=excluded.installed, loaded=excluded.loaded, managed=excluded.managed, installed_version=excluded.installed_version, observed_at=excluded.observed_at');
         $insert = $this->app->db->prepare($sql);
+        $assigned = array_column($this->app->agentRepositories($uid), null, "name");
         foreach ($plugins as $plugin) {
             if (!is_array($plugin) || !preg_match('/^[A-Za-z0-9_-]{1,128}$/', (string)($plugin['name'] ?? ''))) continue;
-            $insert->execute([$uid, $plugin['name'], !empty($plugin['installed']) ? 1 : 0,
+            if (!is_string($plugin['catalog_name'] ?? null) || !isset($assigned[$plugin['catalog_name']])) continue;
+            $insert->execute([$uid, $plugin['catalog_name'], $plugin['name'], !empty($plugin['installed']) ? 1 : 0,
                 !empty($plugin['loaded']) ? 1 : 0, !empty($plugin['managed']) ? 1 : 0,
                 substr((string)($plugin['installed_version'] ?? ''), 0, 64), $observedAt]);
         }
@@ -67,6 +67,16 @@ final class BanquiseApi
             $this->ack(rawurldecode($m[1]), (int)$m[2]);
         }
         $this->json(404, ['error' => 'not_found']);
+    }
+
+    private function keyIds(array $body): array
+    {
+        $keys = $body['catalog_key_ids'] ?? null;
+        if (!is_array($keys) || !array_is_list($keys) || count($keys) > 128) $this->json(422, ['error'=>'invalid_catalog_key_ids']);
+        foreach ($keys as $key) {
+            if (!is_string($key) || !preg_match('/^[0-9a-f]{16}$/D', $key)) $this->json(422, ['error'=>'invalid_catalog_key_ids']);
+        }
+        return array_values(array_unique($keys));
     }
 
     private function register(): never
@@ -84,14 +94,11 @@ final class BanquiseApi
             if ($provided === '' || !hash_equals($configured, $actual)) $this->json(403, ['error' => 'enrollment_denied']);
         }
         $b = $this->body();
-        foreach (['server_uid','mariadb_version','os','architecture','catalog_key_id'] as $field) {
+        foreach (['server_uid','mariadb_version','os','architecture'] as $field) {
             if (!isset($b[$field]) || !is_string($b[$field]) || $b[$field] === '') $this->json(422, ['error' => "missing_$field"]);
         }
         if (!preg_match('/^[A-Za-z0-9_.:-]{8,128}$/', $b['server_uid'])) $this->json(422, ['error' => 'invalid_server_uid']);
-        $expected = $this->app->expectedKeyId();
-        if ($expected === '' || !hash_equals($expected, strtolower($b['catalog_key_id']))) {
-            $this->json(403, ['error' => 'catalog_key_mismatch']);
-        }
+        $keys = $this->keyIds($b);
         if ($this->app->agent($b['server_uid'])) $this->json(409, ['error' => 'already_registered']);
         $token = rtrim(strtr(base64_encode(random_bytes(32)), '+/', '-_'), '=');
         $now = BanquiseApp::now();
@@ -110,7 +117,8 @@ final class BanquiseApi
                  VALUES(?,?,?,?,?,?,?,?,?)"
             );
             $statement->execute([$b['server_uid'], password_hash($token, PASSWORD_ARGON2ID), $b['mariadb_version'],
-                $b['os'], $b['architecture'], strtolower($b['catalog_key_id']), $_SERVER['REMOTE_ADDR'] ?? '', $now, $now]);
+                $b['os'], $b['architecture'], '', $_SERVER['REMOTE_ADDR'] ?? '', $now, $now]);
+            $this->app->recordAgentKeys($b["server_uid"], $keys);
             $this->app->db->commit();
         } catch (Throwable $e) {
             if ($this->app->db->inTransaction()) $this->app->db->rollBack();
@@ -123,6 +131,7 @@ final class BanquiseApi
     {
         $agent = $this->authenticatedAgent($uid);
         $b = $this->body();
+        $keys = $this->keyIds($b);
         $now = BanquiseApp::now();
         $statement = $this->app->db->prepare(
             'UPDATE agents SET mariadb_version=?,os=?,architecture=?,remote_address=?,last_seen_at=?,last_error=? WHERE server_uid=?'
@@ -132,17 +141,22 @@ final class BanquiseApi
             substr((string)($b['last_error'] ?? ''), 0, 2048), $uid]);
         $this->app->db->beginTransaction();
         try {
+            $this->app->recordAgentKeys($uid, $keys);
             $this->replaceAgentPlugins($uid, $b['plugins'] ?? [], $now);
             $this->app->db->commit();
         } catch (Throwable $e) { $this->app->db->rollBack(); throw $e; }
-        $base = rtrim($this->app->config['public_base_url'], '/');
-        $catalogUrl = "$base/catalog.json";
+        $catalogs = $this->app->catalogDescriptors($uid);
         if ($agent['status'] !== 'active') {
-            $this->json(200, ['status' => $agent['status'], 'catalog_url' => $catalogUrl, 'tasks' => []]);
+            $this->json(200, ['status' => $agent['status'], 'catalogs' => $catalogs, 'tasks' => []]);
         }
         $statement = $this->app->db->prepare(
-            "SELECT id,action,plugin_name FROM tasks WHERE server_uid=? AND
-             (state='queued' OR (state='delivered' AND delivered_at < ?)) ORDER BY id LIMIT 20"
+            "SELECT t.id,t.action,t.plugin_name,r.catalog_name FROM tasks t
+             JOIN task_repositories r ON r.task_id=t.id
+             JOIN agent_repositories a ON a.server_uid=t.server_uid AND a.catalog_name=r.catalog_name
+             JOIN fleet_repositories c ON c.name=r.catalog_name
+             JOIN agent_trusted_keys k ON k.server_uid=t.server_uid AND k.key_id=c.key_id
+             WHERE t.server_uid=? AND
+             (state='queued' OR (state='delivered' AND delivered_at < ?)) ORDER BY t.id LIMIT 20"
         );
         $statement->execute([$uid, gmdate('Y-m-d\\TH:i:s\\Z', time() - 300)]); $tasks = $statement->fetchAll();
         if ($tasks) {
@@ -151,7 +165,7 @@ final class BanquiseApi
             $update = $this->app->db->prepare("UPDATE tasks SET state='delivered',delivered_at=? WHERE state IN ('queued','delivered') AND id IN ($marks)");
             $update->execute(array_merge([$now], $ids));
         }
-        $this->json(200, ['status' => 'active', 'catalog_url' => $catalogUrl, 'tasks' => $tasks]);
+        $this->json(200, ['status' => 'active', 'catalogs' => $catalogs, 'tasks' => $tasks]);
     }
 
     private function ack(string $uid, int $id): never

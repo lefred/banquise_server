@@ -13,10 +13,12 @@ require dirname(__DIR__) . '/src/App.php';
 require dirname(__DIR__) . '/src/Auth.php';
 require dirname(__DIR__) . '/src/Mailer.php';
 require dirname(__DIR__) . '/src/Api.php';
+require dirname(__DIR__) . '/src/AdminApi.php';
 $configFile = dirname(__DIR__) . '/config.php';
 if (!is_file($configFile)) { http_response_code(503); exit('Copy config.example.php to config.php and configure Banquise.'); }
 $app = new BanquiseApp(require $configFile);
 $path = $requestPath;
+if (str_starts_with($path, '/api/v1/')) (new BanquiseAdminApi($app))->dispatch($_SERVER['REQUEST_METHOD'], $path);
 if (str_starts_with($path, '/api/')) (new BanquiseApi($app))->dispatch($_SERVER['REQUEST_METHOD'], $path);
 if ($path === '/catalog.pub') {
     // Public by design, like /catalog.json and /catalog.json.minisig: this is
@@ -154,6 +156,21 @@ if ($auth->isAuthenticated() && $_SERVER['REQUEST_METHOD'] === 'POST'
                 if ((string)($_POST['confirmation'] ?? '') !== 'DELETE') throw new InvalidArgumentException('Type DELETE to confirm server removal.');
                 $app->deleteAgent((string)$_POST['uid']);
                 $message = 'Server deleted, including its observed plugin state and task history.';
+                break;
+            case 'fleet_repository_save':
+                $auth->require('catalog_source.manage');
+                $app->saveFleetRepository(trim((string)($_POST['name'] ?? '')), trim((string)($_POST['url'] ?? '')), trim((string)($_POST['public_key'] ?? '')));
+                $message = 'Agent catalog verified and saved.';
+                break;
+            case 'fleet_repository_delete':
+                $auth->require('catalog_source.manage');
+                $app->deleteFleetRepository((string)($_POST['name'] ?? ''));
+                $message = 'Agent catalog removed; pending tasks cancelled.';
+                break;
+            case 'agent_repositories':
+                $auth->require('fleet.manage');
+                $app->assignAgentRepositories((string)$_POST['uid'], is_array($_POST['catalogs'] ?? null) ? $_POST['catalogs'] : []);
+                $message = 'Catalog assignments saved.';
                 break;
             case 'task':
                 $auth->require('fleet.manage');
@@ -302,6 +319,17 @@ if ($auth->isAuthenticated() && $_SERVER['REQUEST_METHOD'] === 'POST'
                 $errors = notifyUserOfSetupLink($app, $mailer, $targetUser, $token);
                 $message = $errors ? ('Could not send the email: ' . implode('; ', $errors)) : 'Setup link re-sent.';
                 break;
+            case 'api_key_create':
+                $auth->require('users.manage');
+                $newApiKeyToken = $app->createApiKey((int)$_POST['user_id'], (string)($_POST['label'] ?? ''));
+                $_SESSION['new_api_key'] = ['label' => (string)($_POST['label'] ?? ''), 'token' => $newApiKeyToken];
+                $message = 'API key created. Copy it now - it will not be shown again.';
+                break;
+            case 'api_key_revoke':
+                $auth->require('users.manage');
+                $app->revokeApiKey((int)$_POST['key_id']);
+                $message = 'API key revoked.';
+                break;
             case 'submission_status':
                 $auth->require('submissions.review');
                 $app->setSubmissionStatus((int)$_POST['submission_id'], (string)($_POST['status'] ?? ''));
@@ -323,8 +351,8 @@ if ($auth->isAuthenticated() && $_SERVER['REQUEST_METHOD'] === 'POST'
     } elseif ((str_starts_with($form, 'catalog_') && !str_starts_with($form, 'catalog_source')) || str_starts_with($form, 'repository')
         || $form === 'authority_verify' || $form === 'authority_sync_entry') {
         $redirect = '/#catalog';
-    } elseif (str_starts_with($form, 'enrollment_') || str_starts_with($form, 'user_') || $form === 'distribution_mode'
-        || str_starts_with($form, 'catalog_source') || $form === 'authority_source') {
+    } elseif (str_starts_with($form, 'enrollment_') || str_starts_with($form, 'user_') || str_starts_with($form, 'api_key_')
+        || str_starts_with($form, 'fleet_repository_') || $form === 'distribution_mode' || str_starts_with($form, 'catalog_source') || $form === 'authority_source') {
         $redirect = '/?page=admin#admin';
     } elseif (str_starts_with($form, 'submission_') && $submissionId !== '') {
         $redirect = '/?page=submissions&submission=' . rawurlencode($submissionId) . '#submissions';
@@ -601,12 +629,12 @@ $heroText = $auth->isAuthenticated()
     $taskCompletionToken = $app->taskCompletionToken($selectedUid);
     $hasPendingTasks = (bool)array_filter($tasks, static fn($task) => in_array($task['state'], ['queued', 'delivered'], true));
     $observedByName = [];
-    foreach ($observed as $item) $observedByName[$item['name']] = $item;
+    foreach ($observed as $item) $observedByName[$item['catalog_name'].':'.$item['name']] = $item;
     $availablePlugins = [];
-    foreach (($catalog['plugins'] ?? []) as $item) {
+    foreach (($app->agentCatalog($selectedUid)['plugins'] ?? []) as $item) {
         $versionMatch = $item['mariadb_version'] === 'any' || str_starts_with($selected['mariadb_version'], $item['mariadb_version']);
         $archMatch = $item['architecture'] === 'any' || $item['architecture'] === $selected['architecture'];
-        if ($versionMatch && $archMatch) $availablePlugins[$item['name']] = $item;
+        if ($versionMatch && $archMatch) $availablePlugins[$item['catalog_name'].':'.$item['name']] = $item;
     }
     ksort($availablePlugins, SORT_NATURAL | SORT_FLAG_CASE);
     $operationTypes = [];
@@ -651,6 +679,7 @@ $heroText = $auth->isAuthenticated()
       </div>
     <?php endif; ?>
   </div>
+  <?php require __DIR__ . "/../src/views/agent-repositories.php"; ?>
   <?php if ($canManageFleet): ?>
     <form method="post" class="bulk-plugin-form">
       <input type="hidden" name="csrf" value="<?=csrf()?>">
@@ -704,8 +733,8 @@ $heroText = $auth->isAuthenticated()
         <table class="plugin-selection-table">
           <thead><tr><th class="check-column"></th><th>Plugin</th><th>Catalog version</th><th>Installed</th><th>Loaded</th><th>Installed version</th></tr></thead>
           <tbody>
-            <?php foreach ($availablePlugins as $name => $catalogPlugin):
-                $state = $observedByName[$name] ?? null;
+            <?php foreach ($availablePlugins as $selectionKey => $catalogPlugin): $name = $catalogPlugin['name'];
+                $state = $observedByName[$selectionKey] ?? null;
                 $installed = !empty($state['installed']);
                 $installedVersion = trim((string)($state['installed_version'] ?? ''));
                 $unmanaged = $installed && empty($state['managed']);
@@ -718,8 +747,8 @@ $heroText = $auth->isAuthenticated()
                 $rowMaturity = strtolower(trim((string)($catalogPlugin['maturity'] ?? 'unknown')) ?: 'unknown');
             ?>
               <tr data-operation-entry data-search-text="<?=h(strtolower($name.' '.($catalogPlugin['plugin_types']??'').' '.$rowMaturity))?>" data-filter-types="<?=h(json_encode($rowTypes,JSON_THROW_ON_ERROR))?>" data-filter-maturity="<?=h($rowMaturity)?>">
-                <td><input type="checkbox" name="plugins[]" value="<?=h($name)?>" aria-label="Select <?=h($name)?>"></td>
-                <td><strong><?=h($name)?></strong><small><?=h($catalogPlugin['plugin_types']??'')?></small></td>
+                <td><input type="checkbox" name="plugins[]" value="<?=h($selectionKey)?>" aria-label="Select <?=h($name)?>"></td>
+                <td><strong><?=h($name)?></strong><small><?=h($catalogPlugin['catalog_name'])?> · <?=h($catalogPlugin['plugin_types']??'')?></small></td>
                 <td><span class="operation-version"><?=h($catalogPlugin['version'])?><?php if ($updateAvailable): ?><span class="operation-update" title="Update available: <?=h($installedVersion)?> → <?=h($catalogPlugin['version'])?>"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 6.5 8.5l1.8 1.8 2.4-2.4v7.4h2.6V7.9l2.4 2.4 1.8-1.8L12 3Zm-7 13v4h14v-4h-2.5v1.5h-9V16H5Z"/></svg>Update</span><?php endif; ?></span></td>
                 <td><span class="state-mark <?=$unmanaged?'unmanaged':($installed?'yes':'no')?>"<?=$unmanaged?' title="Plugin file is present, but it was not installed by Banquise"':''?>><?=$unmanaged?'Unmanaged':($installed?'Installed':'Not installed')?></span></td>
                 <td><span class="state-mark <?=!empty($state['loaded'])?'yes':'no'?>"><?=!empty($state['loaded'])?'Loaded':'Not loaded'?></span></td>
@@ -742,7 +771,7 @@ $heroText = $auth->isAuthenticated()
     <table>
       <thead><tr><th>Plugin</th><th>Catalog version</th><th>Installed</th><th>Loaded</th><th>Installed version</th></tr></thead>
       <tbody>
-        <?php foreach ($availablePlugins as $name => $catalogPlugin): $state = $observedByName[$name] ?? null; $installed = !empty($state['installed']); ?>
+        <?php foreach ($availablePlugins as $selectionKey => $catalogPlugin): $name = $catalogPlugin['name']; $state = $observedByName[$selectionKey] ?? null; $installed = !empty($state['installed']); ?>
           <tr>
             <td><strong><?=h($name)?></strong></td>
             <td><?=h($catalogPlugin['version'])?></td>
@@ -763,7 +792,7 @@ $heroText = $auth->isAuthenticated()
         <tr>
           <td><?=h($task['id'])?></td>
           <td><?=h($task['action'])?></td>
-          <td><?=h($task['plugin_name'])?></td>
+          <td><?=h($task['plugin_name'])?><small><?=h($task['catalog_name'] ?? '')?></small></td>
           <td><span class="badge <?=h($task['state'])?>"><?=h($task['state'])?></span></td>
           <td><?=h($task['result'])?></td>
         </tr>
@@ -1138,6 +1167,9 @@ foreach (($catalog['plugins'] ?? []) as $plugin) {
       $enrollmentMode = $canManageEnrollment ? $app->enrollmentMode() : '';
       $enrollmentTokens = $canManageEnrollment ? $app->enrollmentTokens() : [];
       $users = $canManageUsers ? $app->users() : [];
+      $apiKeys = $canManageUsers ? $app->apiKeys() : [];
+      $newApiKey = $canManageUsers ? ($_SESSION['new_api_key'] ?? null) : null;
+      unset($_SESSION['new_api_key']);
       $distributionMode = ($canManageDistribution && $catalogMode === 'local') ? $app->distributionMode() : '';
       $remoteCatalogUrl = $canManageCatalogSource ? $app->remoteCatalogUrl() : '';
       $remoteCatalogPublicKey = $canManageCatalogSource ? $app->remoteCatalogPublicKey() : '';
@@ -1150,6 +1182,7 @@ foreach (($catalog['plugins'] ?? []) as $plugin) {
     <section id="admin">
       <div class="section-title"><div><span class="eyebrow">SECURITY</span><h2>Administration</h2></div></div>
       <div class="admin-grid">
+        <?php require __DIR__ . "/../src/views/fleet-repositories.php"; ?>
         <?php if ($canManageEnrollment): ?>
           <article class="admin-panel card">
             <h3>Enrollment mode</h3>
@@ -1270,7 +1303,63 @@ foreach (($catalog['plugins'] ?? []) as $plugin) {
               <button>Create user and email a setup link</button>
             </form>
           </article>
-          <article class="admin-panel card users-panel users-list-panel">
+          <article class="admin-panel card users-panel api-keys-panel">
+            <h3>API keys</h3>
+            <p><?=count($apiKeys)?> key(s). A key grants the JSON admin API (<code>/api/v1/...</code>) the same access as the user it's issued for - use a dedicated user per bot/integration to scope and revoke independently.</p>
+            <?php if ($newApiKey): ?>
+              <div class="admin-notice">
+                <strong><?=h($newApiKey['label'])?></strong> created &mdash; copy this key now, it will not be shown again:
+                <div class="token-row">
+                  <div><code><?=h($newApiKey['token'])?></code></div>
+                  <div class="token-actions">
+                    <button type="button" class="small secondary" data-copy-token="<?=h($newApiKey['token'])?>">Copy</button>
+                  </div>
+                </div>
+              </div>
+            <?php endif; ?>
+            <form method="post" class="stack">
+              <input type="hidden" name="csrf" value="<?=csrf()?>">
+              <input type="hidden" name="form" value="api_key_create">
+              <div class="form-grid">
+                <label>Acts as
+                  <select name="user_id" required>
+                    <?php foreach ($users as $keyUser): if ($keyUser['status'] !== 'active') continue; ?>
+                      <option value="<?=h($keyUser['id'])?>"><?=h($keyUser['display_name'] ?: $keyUser['email'])?> (<?=h(implode(', ', array_map('roleLabel', $keyUser['roles'])))?>)</option>
+                    <?php endforeach; ?>
+                  </select>
+                </label>
+                <label>Label<input name="label" placeholder="e.g. Slack bot" required></label>
+              </div>
+              <button>Create API key</button>
+            </form>
+            <div class="token-list">
+              <?php foreach ($apiKeys as $apiKey): ?>
+                <div class="token-row">
+                  <div>
+                    <strong><?=h($apiKey['label'])?></strong>
+                    <small>
+                      Acts as <?=h($apiKey['display_name'] ?: $apiKey['email'])?>
+                      &middot; Created <?=h(str_replace(['T','Z'],[' ',' UTC'],$apiKey['created_at']))?>
+                      &middot; <?=$apiKey['last_used_at']?'Last used '.h(str_replace(['T','Z'],[' ',' UTC'],$apiKey['last_used_at'])):'Never used'?>
+                      <?php if ($apiKey['revoked_at']): ?>&middot; <span class="badge disabled">Revoked</span><?php endif; ?>
+                    </small>
+                  </div>
+                  <?php if (!$apiKey['revoked_at']): ?>
+                    <div class="token-actions">
+                      <form method="post">
+                        <input type="hidden" name="csrf" value="<?=csrf()?>">
+                        <input type="hidden" name="form" value="api_key_revoke">
+                        <input type="hidden" name="key_id" value="<?=h($apiKey['id'])?>">
+                        <button class="small danger">Revoke</button>
+                      </form>
+                    </div>
+                  <?php endif; ?>
+                </div>
+              <?php endforeach; ?>
+              <?php if (!$apiKeys): ?><div class="empty-token-list">No API keys yet.</div><?php endif; ?>
+            </div>
+          </article>
+          <article class="admin-panel card users-panel">
             <h3>Users</h3>
             <p><?=count($users)?> account(s).</p>
             <div class="user-list">

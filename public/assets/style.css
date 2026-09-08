@@ -939,8 +939,12 @@ button.installation-count:disabled {
   padding: 24px;
 }
 
-.users-list-panel {
-  grid-column: 1 / -1;
+/* Always start its own row in the left column, regardless of how many
+   panels precede it (that count varies with which admin sections the
+   viewer can see) - keeps it in a predictable spot instead of drifting
+   to the right column when the count above it is odd. */
+.api-keys-panel {
+  grid-column: 1;
 }
 
 .admin-panel > p,

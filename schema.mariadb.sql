@@ -87,6 +87,21 @@ CREATE TABLE IF NOT EXISTS user_roles (
   CONSTRAINT user_roles_user_fk FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
+-- Bearer tokens for the JSON admin API (e.g. bot/integration access). Each key
+-- acts as the user it belongs to, so its capabilities come from that user's
+-- roles; only the sha256 hash is stored, the plaintext token is shown once.
+CREATE TABLE IF NOT EXISTS api_keys (
+  id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  user_id INT UNSIGNED NOT NULL,
+  label VARCHAR(100) NOT NULL,
+  key_hash CHAR(64) NOT NULL,
+  created_at VARCHAR(20) NOT NULL,
+  last_used_at VARCHAR(20) NULL,
+  revoked_at VARCHAR(20) NULL,
+  UNIQUE KEY api_keys_hash(key_hash),
+  CONSTRAINT api_keys_user_fk FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
 -- Single-use, time-limited links that let a newly created user set their password.
 CREATE TABLE IF NOT EXISTS password_setup_tokens (
   id CHAR(16) NOT NULL PRIMARY KEY,
@@ -155,6 +170,55 @@ CREATE TABLE IF NOT EXISTS catalog_authority_checks (
   status ENUM('verified','differs','missing') NOT NULL,
   authority_entry_json MEDIUMTEXT NOT NULL,
   checked_at VARCHAR(20) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+
+-- Named, verified catalogs available for assignment to managed agents.
+CREATE TABLE IF NOT EXISTS fleet_repositories (
+  name VARCHAR(128) PRIMARY KEY,
+  url TEXT NOT NULL,
+  public_key TEXT NOT NULL,
+  key_id VARCHAR(16) NOT NULL,
+  catalog_json LONGTEXT NOT NULL,
+  synced_at VARCHAR(20) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+-- Catalogs explicitly permitted for each managed server.
+CREATE TABLE IF NOT EXISTS agent_repositories (
+  server_uid VARCHAR(128) NOT NULL,
+  catalog_name VARCHAR(128) NOT NULL,
+  PRIMARY KEY(server_uid,catalog_name),
+  FOREIGN KEY(server_uid) REFERENCES agents(server_uid) ON DELETE CASCADE,
+  FOREIGN KEY(catalog_name) REFERENCES fleet_repositories(name) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+-- Locally provisioned key IDs reported by authenticated agents.
+CREATE TABLE IF NOT EXISTS agent_trusted_keys (
+  server_uid VARCHAR(128) NOT NULL,
+  key_id VARCHAR(16) NOT NULL,
+  PRIMARY KEY(server_uid,key_id),
+  FOREIGN KEY(server_uid) REFERENCES agents(server_uid) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+-- Retain repository identity in task history even after repository removal.
+CREATE TABLE IF NOT EXISTS task_repositories (
+  task_id BIGINT UNSIGNED PRIMARY KEY,
+  catalog_name VARCHAR(128) NOT NULL,
+  FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+-- Repository-scoped inventory; identical plugin names remain distinguishable.
+CREATE TABLE IF NOT EXISTS fleet_inventory (
+  server_uid VARCHAR(128) NOT NULL,
+  catalog_name VARCHAR(128) NOT NULL,
+  name VARCHAR(128) NOT NULL,
+  installed INTEGER NOT NULL DEFAULT 0,
+  loaded INTEGER NOT NULL DEFAULT 0,
+  managed INTEGER NOT NULL DEFAULT 0,
+  installed_version VARCHAR(255) NOT NULL DEFAULT '',
+  observed_at VARCHAR(20) NOT NULL,
+  PRIMARY KEY(server_uid,catalog_name,name),
+  FOREIGN KEY(server_uid) REFERENCES agents(server_uid) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 -- Restore the caller's original session settings.

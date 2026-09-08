@@ -183,27 +183,27 @@ __banquise_agent:__
 ```ini
   [mariadb]
   banquise_agent_controller_url=https://banquise.test:8443
-  banquise_agent_trusted_key_file=/etc/banquise/catalog.pub
+  banquise_agent_trusted_keys_dir=/etc/mariadb/banquise/trusted.d
   banquise_agent_enrollment_token_file=/etc/banquise/enrollment.token
 ```
 
 __banquise_lite:__
 
 ```ini
-  [mariadb]
-  banquise_lite_controller_url=https://banquise.test:8443
-  banquise_lite_trusted_key_file=/etc/banquise/catalog.pub
+  [banquise:development]
+  catalog_url=https://banquise.test:8443/catalog.json
+  trusted_key_file=/etc/banquise/catalog.pub
 ```
 
 
 ## Enrollment lifecycle
 
 1. In dedicated mode, an administrator generates up to ten available tokens and copies one to a MariaDB host. Tokens contain no server metadata. Shared mode continues to use the hash configured in `config.php`.
-2. The agent pins the independently installed catalog public key and submits its key ID, server UID, MariaDB version, OS, and architecture with the enrollment token. That key must reach the agent host through a channel that doesn't depend on this Banquise instance — configuration management, a secrets store, a value recorded when the keypair was generated with `minisign -G`, and so on. Fetching it from `/catalog.pub` at enrollment time would make Banquise the trust anchor for the very key meant to keep it honest: a host serving a malicious catalog could serve a matching
+2. The agent reads independently installed catalog public keys from its trust directory and submits their key IDs, server UID, MariaDB version, OS, and architecture with the enrollment token. That key must reach the agent host through a channel that doesn't depend on this Banquise instance — configuration management, a secrets store, a value recorded when the keypair was generated with `minisign -G`, and so on. Fetching it from `/catalog.pub` at enrollment time would make Banquise the trust anchor for the very key meant to keep it honest: a host serving a malicious catalog could serve a matching
    malicious key just as easily, so `/catalog.pub` is only a convenience for an administrator who already trusts the instance, never the source an agent pins from.
 3. Banquise atomically consumes a dedicated token, creates the registration, and returns a unique random agent credential. A consumed token immediately disappears from the available-token list.
 4. The server appears in quarantine. Polls update inventory but return no work.
-5. An administrator approves it in the UI. Later polls may return queued typed tasks and the authenticated signed-catalog URL.
+5. An administrator approves it in the UI, and a fleet manager assigns catalogs whose keys the agent trusts. Later polls return assigned catalog descriptors and repository-scoped tasks.
 6. Completed tasks are acknowledged. Unacknowledged deliveries are leased and become eligible for redelivery after five minutes.
 
 The enrollment token is used only for bootstrap. After registration the agent uses its unique bearer credential from `banquise-agent.state`; removing the local enrollment-token file does not affect an enrolled agent. Deleting an agent in Banquise revokes that credential. If the state file is lost, delete
@@ -228,6 +228,48 @@ Enrollment-token administration (shared/dedicated mode, generating and revoking 
 
 Creating a user (email, display name, one or more roles) emails them a single-use setup link that expires after `setup_token_ttl_seconds` (default 24 hours); use **Resend setup link** if it lapses before they use it. Users are disabled, not deleted, so task history and submission comments they
 authored stay attributed. Banquise refuses to remove the `administrator` role from, or disable, the last remaining active administrator.
+
+## JSON admin API
+
+Besides the HTML admin UI (cookie session + CSRF) and the agent lifecycle API
+(`/api/v1/agents/...`, used by `banquise_agent` itself), Banquise exposes a
+third, bot-friendly surface at `/api/v1/servers`, `/api/v1/catalog`, and
+`/api/v1/submissions`, authenticated with a per-user bearer API key instead
+of a session cookie — a good fit for a chatbot, dashboard, or other script
+that wants to read fleet/catalog state or queue plugin operations without
+driving a browser.
+
+Mint a key from Admin > Users > **API keys**: pick which existing user it
+acts as (its roles decide what the key can do — the same `BanquiseAuth`
+capabilities as that user's own login) and give it a label. The plaintext
+token (`bq_key_...`) is shown once, right after creation, and only its hash
+is stored; use a dedicated user per bot/integration so keys can be scoped
+and revoked independently of any human's login.
+
+```
+Authorization: Bearer bq_key_...
+```
+
+| Method & path | Capability | Does |
+|---|---|---|
+| `GET /api/v1/servers` | `fleet.view` | List enrolled servers with plugin counts. |
+| `GET /api/v1/servers/{uid}` | `fleet.view` | One server's detail plus its full observed plugin list. |
+| `GET /api/v1/servers/{uid}/tasks` | `fleet.view` | That server's most recent install/update/uninstall tasks. |
+| `GET /api/v1/catalog` | `fleet.view` | The catalog, same shape as the public `catalog.json`. |
+| `GET /api/v1/catalog/updates` | `fleet.view` | Installed plugins with a newer catalog version available, grouped by server. |
+| `GET /api/v1/submissions` | `submissions.review` | Public plugin submissions (optional `?status=`). |
+| `POST /api/v1/servers/{uid}/plugins/{name}/install` | `fleet.manage` | Queue an install task. |
+| `POST /api/v1/servers/{uid}/plugins/{name}/update` | `fleet.manage` | Queue an update task. |
+| `POST /api/v1/servers/{uid}/plugins/{name}/uninstall` | `fleet.manage` | Queue an uninstall task. |
+
+The three write endpoints return `202 Accepted` immediately with the queued
+task, not a completion result — like every plugin operation in Banquise, the
+task is only actually carried out once the agent polls, picks it up, and
+acks it. `{"queued": false, "task": {...}}` means one was already pending for
+that server/plugin/action (queuing is idempotent, matching the same
+`tasks_pending_unique` constraint the HTML UI relies on), not an error. Poll
+`GET /api/v1/servers/{uid}/tasks` (or filter the task id from the response)
+to find out when it finishes.
 
 ## Outbound mail
 
@@ -329,3 +371,51 @@ Each catalog card also provides:
 
 Every mutation requests the encrypted Minisign key password. Banquise writes a staging catalog, signs it through a private stdin pipe, verifies the new signature with the configured public key, and only then replaces the published catalog and signature. Invalid passwords, malformed edits, and GitHub failures
 leave the live pair untouched. Entries are alphabetically re-sorted after every edit, refresh, import, or deletion.
+
+## Multiple catalogs for managed agents
+
+In **Administration → Agent catalogs**, add a repository name, its HTTPS JSON
+catalog URL, and the publisher's Minisign public key. Saving downloads and
+verifies the catalog and its `.minisig` before storing the repository and its
+plugin list. This is separate from the existing public catalog editor and
+local/external publishing mode. To use this server's published catalog, add
+its own `https://your-server/catalog.json` URL and public key as a repository.
+The same public key must be provisioned independently on each agent in its
+`banquise_agent_trusted_keys_dir`.
+
+Agents report their trusted key IDs during registration and each heartbeat.
+On a server's detail page, use **Assigned catalogs** to choose repositories.
+Only repositories with a key trusted by that agent can be assigned. No
+catalog is assigned implicitly to a newly enrolled agent. Repository names
+appear in plugin selection and task history; identical plugin names from
+different repositories have separate rows. Bulk selection carries the
+repository on every plugin operation.
+
+Editing/refreshing or removing a repository cancels its queued/delivered tasks;
+removing an assignment or a reported trusted key cancels affected tasks too.
+Already executing operations cannot be recalled. Removed keys are never
+replaced from server responses. Agents obtain catalogs directly from their
+configured publisher URL and verify signatures locally.
+
+The agent protocol uses `catalog_key_ids` in registration/heartbeat bodies,
+`catalogs: [{name,url,key_id}]` in poll responses, and `catalog_name` on every
+task and inventory entry. Update the server and agents together. Existing
+credentials remain valid. Unscoped pending tasks from the old protocol are
+cancelled during schema initialization and must be queued again after assigning
+repositories.
+
+The admin task API accepts a JSON body such as `{"catalog_name":"community"}`.
+`GET /api/v1/catalog?server_uid=...` returns that agent's assigned catalog entries,
+each with `catalog_name`. Server details include assigned catalog descriptors
+and trusted key IDs.
+
+Run `php bin/init.php` during upgrade if automatic database initialization is
+disabled; the SQLite and MariaDB schema scripts add the fleet repository,
+assignment, trusted-key, task-repository, and inventory tables. Existing public
+catalog data and task history are retained.
+
+Validation: `php tests/fleet_repositories.php` exercises assignment, repository
+ambiguity, task identity, trust revocation, and upgrade behavior.
+
+Run `python3 tests/agent_api.py` for the HTTP protocol tests and
+`python3 tests/signed_repositories.py` for real HTTPS/Minisign publisher tests.

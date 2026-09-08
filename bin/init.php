@@ -5,7 +5,9 @@ $root = dirname(__DIR__);
 if (!is_file("$root/config.php")) copy("$root/config.example.php", "$root/config.php");
 require "$root/src/App.php";
 require "$root/src/Auth.php";
-$app = new BanquiseApp(require "$root/config.php");
+$config = require "$root/config.php";
+$config['database_auto_initialize'] = true;
+$app = new BanquiseApp($config);
 $location = $app->databaseDriver === 'sqlite'
     ? (string)$app->config['database']
     : (string)($app->config['database_name'] ?? 'banquise');

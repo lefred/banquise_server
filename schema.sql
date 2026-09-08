@@ -71,6 +71,19 @@ CREATE TABLE IF NOT EXISTS user_roles (
   PRIMARY KEY(user_id, role)
 );
 
+-- Bearer tokens for the JSON admin API (e.g. bot/integration access). Each key
+-- acts as the user it belongs to, so its capabilities come from that user's
+-- roles; only the sha256 hash is stored, the plaintext token is shown once.
+CREATE TABLE IF NOT EXISTS api_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  label TEXT NOT NULL,
+  key_hash TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  last_used_at TEXT,
+  revoked_at TEXT
+);
+
 -- Single-use, time-limited links that let a newly created user set their password.
 CREATE TABLE IF NOT EXISTS password_setup_tokens (
   id TEXT PRIMARY KEY,
@@ -137,4 +150,52 @@ CREATE TABLE IF NOT EXISTS catalog_authority_checks (
   status TEXT NOT NULL CHECK(status IN ('verified','differs','missing')),
   authority_entry_json TEXT NOT NULL,
   checked_at TEXT NOT NULL
+);
+
+-- Named, verified catalogs available for assignment to managed agents.
+CREATE TABLE IF NOT EXISTS fleet_repositories (
+  name VARCHAR(128) PRIMARY KEY,
+  url TEXT NOT NULL,
+  public_key TEXT NOT NULL,
+  key_id VARCHAR(16) NOT NULL,
+  catalog_json LONGTEXT NOT NULL,
+  synced_at VARCHAR(20) NOT NULL
+);
+
+-- Catalogs explicitly permitted for each managed server.
+CREATE TABLE IF NOT EXISTS agent_repositories (
+  server_uid VARCHAR(128) NOT NULL,
+  catalog_name VARCHAR(128) NOT NULL,
+  PRIMARY KEY(server_uid,catalog_name),
+  FOREIGN KEY(server_uid) REFERENCES agents(server_uid) ON DELETE CASCADE,
+  FOREIGN KEY(catalog_name) REFERENCES fleet_repositories(name) ON DELETE CASCADE
+);
+
+-- Locally provisioned key IDs reported by authenticated agents.
+CREATE TABLE IF NOT EXISTS agent_trusted_keys (
+  server_uid VARCHAR(128) NOT NULL,
+  key_id VARCHAR(16) NOT NULL,
+  PRIMARY KEY(server_uid,key_id),
+  FOREIGN KEY(server_uid) REFERENCES agents(server_uid) ON DELETE CASCADE
+);
+
+-- Retain repository identity in task history even after repository removal.
+CREATE TABLE IF NOT EXISTS task_repositories (
+  task_id INTEGER PRIMARY KEY,
+  catalog_name VARCHAR(128) NOT NULL,
+  FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+);
+
+-- Repository-scoped inventory; identical plugin names remain distinguishable.
+CREATE TABLE IF NOT EXISTS fleet_inventory (
+  server_uid VARCHAR(128) NOT NULL,
+  catalog_name VARCHAR(128) NOT NULL,
+  name VARCHAR(128) NOT NULL,
+  installed INTEGER NOT NULL DEFAULT 0,
+  loaded INTEGER NOT NULL DEFAULT 0,
+  managed INTEGER NOT NULL DEFAULT 0,
+  installed_version VARCHAR(255) NOT NULL DEFAULT '',
+  observed_at VARCHAR(20) NOT NULL,
+  PRIMARY KEY(server_uid,catalog_name,name),
+  FOREIGN KEY(server_uid) REFERENCES agents(server_uid) ON DELETE CASCADE
 );

@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="banquise-blue" x1="32" y1="24" x2="224" y2="232" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#06395e"/>
+      <stop offset="1" stop-color="#002b64"/>
+    </linearGradient>
+    <radialGradient id="banquise-sheen" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(58 46) rotate(48) scale(160 120)">
+      <stop stop-color="#ffffff" stop-opacity=".24"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect x="12" y="12" width="232" height="232" rx="68" fill="url(#banquise-blue)"/>
+  <rect x="12" y="12" width="232" height="232" rx="68" fill="url(#banquise-sheen)"/>
+
+  <!-- subtle ice-floe fracture accents -->
+  <g stroke="#ffffff" stroke-opacity=".18" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <path d="M26 182 L54 168 L48 198"/>
+    <path d="M214 40 L236 58 L208 66"/>
+  </g>
+
+  <g transform="translate(-14,-10) scale(4)">
+    <path fill="#fff" d="M22 15h12.4c8.2 0 13 3.6 13 10.1 0 4.1-2.1 7.1-5.8 8.5 4.7 1.2 7.4 4.6 7.4 9.3C49 50 43.8 54 34.7 54H22V15Zm7.2 6.1v10h4.6c4.2 0 6.3-1.7 6.3-5.1 0-3.3-2.1-4.9-6.3-4.9h-4.6Zm0 15.9v10.9h5.1c4.9 0 7.3-1.8 7.3-5.5S39.2 37 34.3 37h-5.1Z"/>
+  </g>
+</svg>

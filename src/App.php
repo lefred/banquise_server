@@ -1,8 +1,12 @@
 <?php
 declare(strict_types=1);
 
+require_once __DIR__ . "/FleetRepositories.php";
+
 final class BanquiseApp
 {
+    use BanquiseFleetRepositories;
+
     public readonly PDO $db;
     public readonly string $databaseDriver;
 
@@ -30,6 +34,7 @@ final class BanquiseApp
             $this->db->exec(file_get_contents(dirname(__DIR__) . '/schema.sql'));
             $this->migrateAgentPluginManagement();
             $this->migrateTaskUniqueness();
+            $this->cancelUnscopedTasks();
         } else {
             $host = (string)($config['database_host'] ?? '127.0.0.1');
             $port = (int)($config['database_port'] ?? 3306);
@@ -47,8 +52,14 @@ final class BanquiseApp
             if (($config['database_auto_initialize'] ?? true) === true) {
                 $this->db->exec(file_get_contents(dirname(__DIR__) . '/schema.mariadb.sql'));
                 $this->migrateAgentPluginManagement();
+                $this->cancelUnscopedTasks();
             }
         }
+    }
+
+    private function cancelUnscopedTasks(): void
+    {
+        $this->db->exec("UPDATE tasks SET state='cancelled',result='Repository selection required; queue this operation again' WHERE state IN ('queued','delivered') AND id NOT IN (SELECT task_id FROM task_repositories)");
     }
 
     private function migrateAgentPluginManagement(): void
@@ -254,7 +265,7 @@ final class BanquiseApp
 
     public function agentPlugins(string $uid): array
     {
-        $statement = $this->db->prepare('SELECT * FROM agent_plugins WHERE server_uid=? ORDER BY name');
+        $statement = $this->db->prepare('SELECT * FROM fleet_inventory WHERE server_uid=? ORDER BY catalog_name,name');
         $statement->execute([$uid]);
         return $statement->fetchAll();
     }
@@ -262,10 +273,10 @@ final class BanquiseApp
     public function installedPluginServers(): array
     {
         return $this->db->query(
-            "SELECT p.name,p.installed_version,p.loaded,p.observed_at,
+            "SELECT p.catalog_name,p.name,p.installed_version,p.loaded,p.observed_at,
                     a.server_uid,a.display_name,a.status,a.mariadb_version,
                     a.architecture,a.last_seen_at
-             FROM agent_plugins p JOIN agents a ON a.server_uid=p.server_uid
+             FROM fleet_inventory p JOIN agents a ON a.server_uid=p.server_uid
              WHERE p.installed=1
              ORDER BY p.name,a.display_name,a.server_uid"
         )->fetchAll();
@@ -274,14 +285,15 @@ final class BanquiseApp
     public function pluginUpdatesByServer(array $catalog): array
     {
         $installed = $this->db->query(
-            "SELECT p.name,p.installed_version,a.server_uid,a.mariadb_version,a.architecture
-             FROM agent_plugins p JOIN agents a ON a.server_uid=p.server_uid
+            "SELECT p.catalog_name,p.name,p.installed_version,a.server_uid,a.mariadb_version,a.architecture
+             FROM fleet_inventory p JOIN agents a ON a.server_uid=p.server_uid
              WHERE p.installed=1 AND p.installed_version<>''"
         )->fetchAll();
         $updates = [];
         foreach ($installed as $current) {
             $newest = null;
-            foreach (($catalog['plugins'] ?? []) as $candidate) {
+            foreach (($this->agentCatalog($current['server_uid'])['plugins'] ?? []) as $candidate) {
+                if ($candidate['catalog_name'] !== $current['catalog_name']) continue;
                 if (($candidate['name'] ?? '') !== $current['name']) continue;
                 $mariaDb = (string)($candidate['mariadb_version'] ?? '');
                 $architecture = (string)($candidate['architecture'] ?? '');
@@ -296,6 +308,7 @@ final class BanquiseApp
             if ($newest !== null && version_compare($newest, $installedVersion, '>')) {
                 $updates[$current['server_uid']][] = [
                     'name' => $current['name'],
+                    'catalog_name' => $current['catalog_name'],
                     'installed_version' => $current['installed_version'],
                     'available_version' => $newest,
                 ];
@@ -309,19 +322,19 @@ final class BanquiseApp
     public function pluginCountsByServer(array $catalog, array $agents): array
     {
         $installedByServer = [];
-        foreach ($this->db->query('SELECT server_uid,name FROM agent_plugins WHERE installed=1')->fetchAll() as $plugin) {
-            $installedByServer[$plugin['server_uid']][(string)$plugin['name']] = true;
+        foreach ($this->db->query('SELECT server_uid,catalog_name,name FROM fleet_inventory WHERE installed=1')->fetchAll() as $plugin) {
+            $installedByServer[$plugin['server_uid']][$plugin['catalog_name'].':'.$plugin['name']] = true;
         }
         $counts = [];
         foreach ($agents as $agent) {
             $available = [];
-            foreach (($catalog['plugins'] ?? []) as $candidate) {
+            foreach (($this->agentCatalog($agent['server_uid'])['plugins'] ?? []) as $candidate) {
                 $mariaDb = (string)($candidate['mariadb_version'] ?? '');
                 $architecture = (string)($candidate['architecture'] ?? '');
                 if ($mariaDb !== 'any' && !str_starts_with((string)$agent['mariadb_version'], $mariaDb)) continue;
                 if ($architecture !== 'any' && $architecture !== $agent['architecture']) continue;
                 $name = (string)($candidate['name'] ?? '');
-                if ($name !== '') $available[$name] = true;
+                if ($name !== '') $available[$candidate['catalog_name'].':'.$name] = true;
             }
             $installed = array_intersect_key($installedByServer[$agent['server_uid']] ?? [], $available);
             $counts[$agent['server_uid']] = ['installed' => count($installed), 'available' => count($available)];
@@ -331,7 +344,7 @@ final class BanquiseApp
 
     public function tasks(string $uid): array
     {
-        $statement = $this->db->prepare('SELECT * FROM tasks WHERE server_uid=? ORDER BY id DESC LIMIT 100');
+        $statement = $this->db->prepare('SELECT t.*,r.catalog_name FROM tasks t LEFT JOIN task_repositories r ON r.task_id=t.id WHERE server_uid=? ORDER BY t.id DESC LIMIT 100');
         $statement->execute([$uid]);
         return $statement->fetchAll();
     }
@@ -377,12 +390,12 @@ final class BanquiseApp
         $statement->execute([$uid]);
     }
 
-    public function queueTask(string $uid, string $action, string $plugin): void
+    public function queueTask(string $uid, string $action, string $plugin, string $catalogName = ""): void
     {
-        $this->queueTasks($uid, $action, [$plugin]);
+        $this->queueTasks($uid, $action, [$plugin], $catalogName);
     }
 
-    public function queueTasks(string $uid, string $action, array $plugins): int
+    public function queueTasks(string $uid, string $action, array $plugins, string $catalogName = ""): int
     {
         if (!in_array($action, ['install', 'update', 'uninstall', 'load'], true)) {
             throw new InvalidArgumentException('Invalid action');
@@ -390,24 +403,45 @@ final class BanquiseApp
         if (!$this->agent($uid)) throw new InvalidArgumentException('Unknown agent');
         $plugins = array_values(array_unique(array_map(static fn($value): string => trim((string)$value), $plugins)));
         if (!$plugins) throw new InvalidArgumentException('Select at least one plugin');
-        $catalogNames = [];
-        foreach ($this->catalog()['plugins'] ?? [] as $entry) $catalogNames[(string)$entry['name']] = true;
+        $agent = $this->agent($uid);
+        $keys = $this->agentKeyIds($uid);
+        $repositories = array_column($this->agentRepositories($uid), null, 'name');
+        $selected = [];
         foreach ($plugins as $plugin) {
-            if (!preg_match('/^[A-Za-z0-9_-]{1,128}$/', $plugin) || !isset($catalogNames[$plugin])) {
-                throw new InvalidArgumentException("Unknown catalog plugin: $plugin");
+            // HTML bulk selection encodes the explicit repository and plugin.
+            $repo = $catalogName;
+            $name = $plugin;
+            if (str_contains($plugin, ':')) [$repo,$name] = explode(':', $plugin, 2);
+            if (!preg_match('/^[A-Za-z0-9_-]{1,128}$/D', $name)) throw new InvalidArgumentException('Invalid plugin name.');
+            $matches = [];
+            foreach ($this->agentCatalog($uid)['plugins'] as $entry) {
+                if ($entry['name'] !== $name || ($repo !== '' && $entry['catalog_name'] !== $repo)) continue;
+                if ($entry['mariadb_version'] !== 'any' && !str_starts_with($agent['mariadb_version'], $entry['mariadb_version'])) continue;
+                if ($entry['architecture'] !== 'any' && $entry['architecture'] !== $agent['architecture']) continue;
+                $matches[$entry['catalog_name']] = true;
             }
+            if (count($matches) !== 1) throw new InvalidArgumentException("Select one assigned, compatible repository for $name.");
+            $repo = array_key_first($matches);
+            if (!in_array($repositories[$repo]['key_id'], $keys, true)) throw new InvalidArgumentException('Agent does not trust this repository key.');
+            if (isset($selected[$name]) && $selected[$name] !== $repo) throw new InvalidArgumentException('Select only one repository per plugin operation.');
+            $selected[$name] = $repo;
         }
         $insertSql = "INSERT INTO tasks(server_uid,action,plugin_name,state,requested_at) VALUES(?,?,?,'queued',?)";
         $created = 0;
         $this->db->beginTransaction();
         try {
-            foreach ($plugins as $plugin) {
+            foreach ($selected as $plugin => $repo) {
                 try {
                     $statement = $this->db->prepare($insertSql);
                     $statement->execute([$uid, $action, $plugin, self::now()]);
-                    $created += $statement->rowCount();
+                    $taskId = $this->db->lastInsertId();
+                    $this->db->prepare('INSERT INTO task_repositories(task_id,catalog_name) VALUES(?,?)')->execute([$taskId,$repo]);
+                    ++$created;
                 } catch (PDOException $e) {
                     if (!$this->isDuplicateKey($e)) throw $e;
+                    $q = $this->db->prepare("SELECT r.catalog_name FROM tasks t LEFT JOIN task_repositories r ON r.task_id=t.id WHERE t.server_uid=? AND t.action=? AND t.plugin_name=? AND t.state IN ('queued','delivered')");
+                    $q->execute([$uid,$action,$plugin]);
+                    if ($q->fetchColumn() !== $repo) throw new InvalidArgumentException('A task from another repository is already pending for this plugin.');
                 }
             }
             $this->db->commit();
@@ -1640,6 +1674,57 @@ final class BanquiseApp
             $this->db->rollBack();
             throw $e;
         }
+    }
+
+    // ------------------------------------------------------------------
+    // JSON admin API keys (bot/integration access to /api/v1/*).
+    // ------------------------------------------------------------------
+
+    public function apiKeys(): array
+    {
+        return $this->db->query(
+            'SELECT k.id, k.label, k.created_at, k.last_used_at, k.revoked_at,
+                    u.id AS user_id, u.email, u.display_name
+             FROM api_keys k JOIN users u ON u.id = k.user_id
+             ORDER BY (k.revoked_at IS NOT NULL), k.created_at DESC'
+        )->fetchAll();
+    }
+
+    /** Mints a new key acting as $userId and returns the plaintext token; only its hash is stored. */
+    public function createApiKey(int $userId, string $label): string
+    {
+        $label = trim($label);
+        if ($label === '') throw new InvalidArgumentException('Give the key a label.');
+        if (!$this->user($userId)) throw new InvalidArgumentException('Unknown user.');
+        $token = 'bq_key_' . rtrim(strtr(base64_encode(random_bytes(32)), '+/', '-_'), '=');
+        $statement = $this->db->prepare('INSERT INTO api_keys(user_id,label,key_hash,created_at) VALUES(?,?,?,?)');
+        $statement->execute([$userId, $label, hash('sha256', $token), self::now()]);
+        return $token;
+    }
+
+    public function revokeApiKey(int $id): void
+    {
+        $statement = $this->db->prepare('UPDATE api_keys SET revoked_at=? WHERE id=? AND revoked_at IS NULL');
+        $statement->execute([self::now(), $id]);
+    }
+
+    /**
+     * Authenticates a JSON admin API request. A key acts as the user it was
+     * issued for, so its capabilities are simply that user's roles - same
+     * BanquiseAuth as a session login, just reached by bearer token instead
+     * of a cookie. Returns guest auth (no capabilities) for anything invalid,
+     * revoked, or belonging to a since-disabled user.
+     */
+    public function authenticateApiKey(string $token): BanquiseAuth
+    {
+        if ($token === '') return BanquiseAuth::guest();
+        $statement = $this->db->prepare('SELECT id,user_id FROM api_keys WHERE key_hash=? AND revoked_at IS NULL');
+        $statement->execute([hash('sha256', $token)]);
+        $key = $statement->fetch();
+        if (!$key) return BanquiseAuth::guest();
+        $update = $this->db->prepare('UPDATE api_keys SET last_used_at=? WHERE id=?');
+        $update->execute([self::now(), $key['id']]);
+        return $this->currentUser((int)$key['user_id']);
     }
 
     // ------------------------------------------------------------------
