@@ -327,9 +327,11 @@ The Verify icon itself turns red if anything differs or is missing, green once e
 Use **Add GitHub repository** in the Catalog panel. Two asset naming conventions are recognized; a release is scanned for the first, and only if nothing matches, for the second:
 
 ```text
-NAME-vVERSION-mariadbMAJOR.MINOR-OS-ARCH.tar.gz   (a tar.gz archive)
-NAME-VERSION-mariadbMAJOR.MINOR-OS.so             (a standalone .so file)
+NAME-vVERSION-mariadbMAJOR.MINOR[.PATCH]-OS-ARCH.tar.gz   (a tar.gz archive)
+NAME-VERSION-mariadbMAJOR.MINOR[.PATCH]-OS.so             (a standalone .so file)
 ```
+
+The optional `.PATCH` component is accepted and preserved in the catalog: for example, `mariadb13.0.2` produces a MariaDB version of `13.0.2`.
 
 `OS` is a free-form target tag — `linux`, `el8`, `ubuntu24.04`, and so on. A release with several OS builds for the same MariaDB version and architecture (e.g. both `el8` and `ubuntu24.04` for `x86_64`) becomes one catalog entry per OS, not one that overwrites the other. The catalog page still shows one card
 per plugin: when it has more than one build variant, a small disclosure ("N build variants") expands into a table of every version/MariaDB version/architecture/OS combination, each with its own Edit/Refresh/Delete;

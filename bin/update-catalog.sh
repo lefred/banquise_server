@@ -10,8 +10,10 @@ Create or update catalog entries from the latest GitHub release. Two asset
 naming conventions are recognized; a release is scanned for the first, and
 only if none match, for the second:
 
-  NAME-vVERSION-mariadbMAJOR.MINOR-OS-ARCH.tar.gz   (a tar.gz archive)
-  NAME-VERSION-mariadbMAJOR.MINOR-OS.so             (a standalone .so file)
+  NAME-vVERSION-mariadbMAJOR.MINOR[.PATCH]-OS-ARCH.tar.gz   (a tar.gz archive)
+  NAME-VERSION-mariadbMAJOR.MINOR[.PATCH]-OS.so             (a standalone .so file)
+
+The optional MariaDB PATCH version is preserved in the catalog when present.
 
 OS is a free-form target tag such as "linux", "el8", or "ubuntu24.04"; each
 distinct OS (and, for the archive form, ARCH) for the same MariaDB version
@@ -231,12 +233,12 @@ else
 fi
 
 mapfile -t assets < <(jq -r '.assets[] |
-  select(.name | test("-mariadb[0-9]+\\.[0-9]+-[A-Za-z0-9_.]+-[A-Za-z0-9_]+\\.tar\\.gz$")) |
+  select(.name | test("-mariadb[0-9]+\\.[0-9]+(\\.[0-9]+)?-[A-Za-z0-9_.]+-[A-Za-z0-9_]+\\.tar\\.gz$")) |
   [.name, .browser_download_url] | @tsv' "$work_dir/release.json")
 asset_format=tar.gz
 if ((${#assets[@]} == 0)); then
   mapfile -t assets < <(jq -r '.assets[] |
-    select(.name | test("-mariadb[0-9]+\\.[0-9]+-[A-Za-z0-9_.]+\\.so$")) |
+    select(.name | test("-mariadb[0-9]+\\.[0-9]+(\\.[0-9]+)?-[A-Za-z0-9_.]+\\.so$")) |
     [.name, .browser_download_url] | @tsv' "$work_dir/release.json")
   asset_format=so
 fi
@@ -246,20 +248,20 @@ for asset_record in "${assets[@]}"; do
   IFS=$'\t' read -r asset_name download_url <<<"$asset_record"
 
   if [[ "$asset_format" == tar.gz ]]; then
-    if [[ ! "$asset_name" =~ ^(.+)-v?${version//./\\.}-mariadb([0-9]+\.[0-9]+)-([A-Za-z0-9_.]+)-([A-Za-z0-9_]+)\.tar\.gz$ ]]; then
+    if [[ ! "$asset_name" =~ ^(.+)-v?${version//./\\.}-mariadb([0-9]+\.[0-9]+(\.[0-9]+)?)-([A-Za-z0-9_.]+)-([A-Za-z0-9_]+)\.tar\.gz$ ]]; then
       die "asset does not match release version and naming contract: $asset_name"
     fi
     asset_stem=${BASH_REMATCH[1]}
     mariadb_version=${BASH_REMATCH[2]}
-    os=${BASH_REMATCH[3]}
-    architecture=${BASH_REMATCH[4]}
+    os=${BASH_REMATCH[4]}
+    architecture=${BASH_REMATCH[5]}
   else
-    if [[ ! "$asset_name" =~ ^(.+)-v?${version//./\\.}-mariadb([0-9]+\.[0-9]+)-([A-Za-z0-9_.]+)\.so$ ]]; then
+    if [[ ! "$asset_name" =~ ^(.+)-v?${version//./\\.}-mariadb([0-9]+\.[0-9]+(\.[0-9]+)?)-([A-Za-z0-9_.]+)\.so$ ]]; then
       die "asset does not match release version and naming contract: $asset_name"
     fi
     asset_stem=${BASH_REMATCH[1]}
     mariadb_version=${BASH_REMATCH[2]}
-    os=${BASH_REMATCH[3]}
+    os=${BASH_REMATCH[4]}
     architecture=${architecture_override:-x86_64}
   fi
   plugin_name=${name_override:-${asset_stem//-/_}}
